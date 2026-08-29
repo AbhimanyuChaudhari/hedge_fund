@@ -22,12 +22,17 @@ def update_env_token(token: str):
     with open(env_path, 'w') as f:
         f.write(content)
 
+def click_button(driver):
+    """Click the first visible button using JavaScript."""
+    driver.execute_script(
+        "document.querySelector('button').click()"
+    )
+
 def get_token():
-    kite = KiteConnect(api_key=settings.zerodha_api_key)
+    kite      = KiteConnect(api_key=settings.zerodha_api_key)
     login_url = kite.login_url()
 
     options = webdriver.ChromeOptions()
-    # headless removed for debugging — add back once working
     options.add_argument('--headless')
     options.add_argument('--no-sandbox')
     options.add_argument('--disable-dev-shm-usage')
@@ -41,26 +46,29 @@ def get_token():
     try:
         print("Opening Zerodha login...")
         driver.get(login_url)
+        time.sleep(2)
 
-        # Enter user ID
-        wait.until(EC.presence_of_element_located((By.ID, 'userid')))
+        # Step 1 — credentials
         driver.find_element(By.ID, 'userid').send_keys(settings.zerodha_client_id)
         driver.find_element(By.ID, 'password').send_keys(settings.zerodha_password)
-        driver.find_element(By.XPATH, '//button[@type="submit"]').click()
-
-        # Enter TOTP
-        totp = pyotp.TOTP(settings.zerodha_totp_secret)
-        wait.until(EC.presence_of_element_located((By.XPATH, '//input[@type="number"]')))
-        driver.find_element(By.XPATH, '//input[@type="number"]').send_keys(totp.now())
-        driver.find_element(By.XPATH, '//button[@type="submit"]').click()
-
-        # Capture redirect URL with request token
+        time.sleep(1)
+        click_button(driver)
         time.sleep(3)
+        print(f"After login: {driver.current_url}")
+
+        # Step 2 — TOTP
+        totp = pyotp.TOTP(settings.zerodha_totp_secret)
+        wait.until(EC.presence_of_element_located((By.ID, 'userid')))
+        time.sleep(1)
+        driver.find_element(By.ID, 'userid').send_keys(totp.now())
+        time.sleep(1)
+        click_button(driver)
+        time.sleep(4)
+
         current_url = driver.current_url
-        print(f"Redirect URL: {current_url}")
+        print(f"Final URL: {current_url}")
         request_token = current_url.split('request_token=')[1].split('&')[0]
 
-        # Exchange for access token
         data = kite.generate_session(request_token, api_secret=settings.zerodha_api_secret)
         access_token = data['access_token']
 
