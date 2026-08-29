@@ -13,6 +13,11 @@ Usage:
     python backtest_options.py --underlying NIFTY --date 2026-05-06
 """
 
+"""
+Options Backtest with Delta Hedging
+"""
+
+import os
 import argparse
 import math
 import logging
@@ -21,14 +26,18 @@ import duckdb
 import pandas as pd
 from collections import defaultdict
 from datetime import date
+from dotenv import load_dotenv
 from strategies.backtesting.options_data_loader import iter_option_bars
 from execution.risk.transaction_costs import TransactionCosts
 from execution.orders.delta_hedger import DeltaHedger
 
+load_dotenv()
 logging.basicConfig(level=logging.WARNING)
 
-PROJECT_ID  = "hedge-fund-494103"
-BUCKET_NAME = "hedge-fund-494103-marketdata-mumbai"
+BUCKET_NAME = os.getenv('S3_BUCKET_NAME', 'hedge-fund-data-ac')
+AWS_KEY     = os.getenv('AWS_ACCESS_KEY_ID')
+AWS_SECRET  = os.getenv('AWS_SECRET_ACCESS_KEY')
+AWS_REGION  = os.getenv('AWS_REGION', 'ap-south-1')
 
 LOT_SIZES = {
     "NIFTY":     75,
@@ -37,38 +46,57 @@ LOT_SIZES = {
 }
 
 FUTURES_SYMBOLS = {
-    "NIFTY":     "NIFTY26MAYFUT",
-    "BANKNIFTY": "BANKNIFTY26MAYFUT",
+    "NIFTY":     "NIFTY26SEPFUT",
+    "BANKNIFTY": "BANKNIFTY26SEPFUT",
 }
 
 
-# ─────────────────────────────────────
-# Futures price loader
-# ─────────────────────────────────────
+def _get_s3():
+    return boto3.client('s3',
+        aws_access_key_id=AWS_KEY,
+        aws_secret_access_key=AWS_SECRET,
+        region_name=AWS_REGION
+    )
+
+
+def _s3_exists(key: str) -> bool:
+    try:
+        _get_s3().head_object(Bucket=BUCKET_NAME, Key=key)
+        return True
+    except Exception:
+        return False
+
+
+def _get_duckdb_con() -> duckdb.DuckDBPyConnection:
+    con = duckdb.connect()
+    con.execute(f"""
+        CREATE SECRET IF NOT EXISTS s3_secret (
+            TYPE S3,
+            KEY_ID '{AWS_KEY}',
+            SECRET '{AWS_SECRET}',
+            REGION '{AWS_REGION}'
+        )
+    """)
+    return con
+
+
 def load_futures_prices(underlying: str, date_str: str) -> dict:
-    """
-    Load futures prices keyed by ts_sec.
-    Returns {ts_sec: close_price}
-    """
     symbol = FUTURES_SYMBOLS.get(underlying)
     if not symbol:
         return {}
 
-    fs  = _get_s3_client()
-    con = duckdb.connect()
-    con.register_filesystem(fs)
-
-    path = (f"s3://{BUCKET_NAME}/processed/features/"
-            f"{symbol}/{date_str}.parquet")
-
-    if not fs.exists(path.replace("s3://", "")):
+    key = f"processed/features/{symbol}/{date_str}.parquet"
+    if not _s3_exists(key):
         print(f"  No futures data for {symbol} {date_str} — no delta hedge")
         return {}
+
+    s3_path = f"s3://{BUCKET_NAME}/{key}"
+    con     = _get_duckdb_con()
 
     try:
         df = con.execute(f"""
             SELECT ts_sec, close, high, low
-            FROM read_parquet('{path}')
+            FROM read_parquet('{s3_path}')
             ORDER BY ts_sec
         """).df()
         return {

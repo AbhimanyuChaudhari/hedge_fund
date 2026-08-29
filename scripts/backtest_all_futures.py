@@ -4,51 +4,43 @@ Fast Batch Backtest — All Stock Futures
 Supports both V1 (fast Numba engine) and V2 (Ricci Hawkes-Alpha).
 
 Usage:
-    # V1 — default params
-    python backtest_all_futures_fast.py --start 2026-05-27 --end 2026-05-27
-
-    # V1 — with optimized per-symbol params from grid search
-    python backtest_all_futures_fast.py --start 2026-05-27 --end 2026-05-27 --use-optimal-params
-
-    # V2 — fast Numba version
-    python backtest_all_futures_fast.py --start 2026-05-27 --end 2026-05-27 --model v2
-
-    # Multi-day (works across contract rolls automatically)
-    python backtest_all_futures_fast.py --start 2026-05-13 --end 2026-05-27 --use-optimal-params
+    python scripts/backtest_all_futures.py --start 2026-05-27 --end 2026-05-27
+    python scripts/backtest_all_futures.py --start 2026-05-27 --end 2026-05-27 --use-optimal-params
+    python scripts/backtest_all_futures.py --start 2026-05-27 --end 2026-05-27 --model v2
 
 Contract roll handling:
-    Uses known NSE expiry dates (NSE adjusts for holidays).
-    Add new entries to NSE_EXPIRY_DATES each month.
-    Falls back to last-Thursday calculation for unknown months.
-
-Speed:
-    V1 (Numba):  ~10-15 seconds per day across 85 symbols
-    V2 (Numba):  ~30 seconds per day across 85 symbols
+    Expiry dates loaded dynamically from Zerodha API — no manual updates needed.
+    Falls back to last-Thursday calculation if API unavailable.
 """
 
+import os
 import re
 import calendar
 import argparse
+import functools
 import time
 import boto3
 import pandas as pd
 from datetime import date, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from strategies.backtesting.fill_simulator import run_fast_backtest
 from strategies.backtesting.data_loader import load_day
 from strategies.backtesting.param_loader import get_symbol_params
 
-PROJECT_ID  = "hedge-fund-494103"
-BUCKET_NAME = "hedge-fund-494103-marketdata-mumbai"
+BUCKET_NAME = os.getenv('S3_BUCKET_NAME', 'hedge-fund-data-ac')
+AWS_KEY     = os.getenv('AWS_ACCESS_KEY_ID')
+AWS_SECRET  = os.getenv('AWS_SECRET_ACCESS_KEY')
+AWS_REGION  = os.getenv('AWS_REGION', 'ap-south-1')
 
-# Index futures base names — excluded from stock futures backtest
 INDEX_BASES = {
     "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY",
     "SENSEX", "NIFTYNXT50", "BANKEX",
 }
 
-# Regex to strip contract suffix: 26MAYFUT, 26JUNFUT, 27JANFUT etc.
 _CONTRACT_RE = re.compile(
     r'\d{2}(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)FUT$',
     re.IGNORECASE
@@ -60,50 +52,48 @@ _MONTH_MAP = {
     'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12,
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Known NSE expiry dates
-# NSE sometimes adjusts for public holidays — always verify manually
-# Add new entries each month before the contract expires
-# ─────────────────────────────────────────────────────────────────────────────
-
-NSE_EXPIRY_DATES = {
-    (2026, 1):  date(2026, 1, 29),   # JANFUT
-    (2026, 2):  date(2026, 2, 26),   # FEBFUT
-    (2026, 3):  date(2026, 3, 26),   # MARFUT
-    (2026, 4):  date(2026, 4, 23),   # APRFUT — adjusted (Apr 30 is holiday)
-    (2026, 5):  date(2026, 5, 26),   # MAYFUT — adjusted (May 28 is holiday)
-    (2026, 6):  date(2026, 6, 25),   # JUNFUT
-    (2026, 7):  date(2026, 7, 30),   # JULFUT
-    (2026, 8):  date(2026, 8, 27),   # AUGFUT
-    (2026, 9):  date(2026, 9, 24),   # SEPFUT
-    (2026, 10): date(2026, 10, 29),  # OCTFUT
-    (2026, 11): date(2026, 11, 26),  # NOVFUT
-    (2026, 12): date(2026, 12, 31),  # DECFUT
-}
-
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Contract helpers
+# Dynamic expiry dates from Zerodha
 # ─────────────────────────────────────────────────────────────────────────────
 
-def strip_contract_suffix(symbol: str) -> str:
-    """CHOLAFIN26JUNFUT → CHOLAFIN"""
-    return _CONTRACT_RE.sub('', symbol)
+@functools.lru_cache(maxsize=1)
+def _load_nfo_expiries() -> dict:
+    """
+    Load all F&O expiry dates from Zerodha API.
+    Returns {(year, month): expiry_date} for all active contracts.
+    Cached in memory — only fetches once per process.
+    """
+    try:
+        from data.ingest.zerodha_client import ZerodhaClient
+        kite        = ZerodhaClient().kite
+        instruments = pd.DataFrame(kite.instruments("NFO"))
+        futures     = instruments[instruments['instrument_type'] == 'FUT'].copy()
+        futures['expiry'] = pd.to_datetime(futures['expiry']).dt.date
 
+        expiry_map = {}
+        for _, row in futures.iterrows():
+            exp = row['expiry']
+            key = (exp.year, exp.month)
+            if key not in expiry_map or exp > expiry_map[key]:
+                expiry_map[key] = exp
 
-def is_index_future(symbol: str) -> bool:
-    """Return True if symbol is an index future."""
-    return strip_contract_suffix(symbol) in INDEX_BASES
+        return expiry_map
+
+    except Exception as e:
+        print(f"Could not load expiries from Zerodha ({e}) — using fallback")
+        return {}
 
 
 def get_contract_expiry(year: int, month: int) -> date:
     """
     Returns NSE futures expiry date for a given month/year.
-    Uses known dates where available (NSE adjusts for holidays),
-    falls back to last Thursday calculation for unknown months.
+    Fetches from Zerodha API — accurate including holiday adjustments.
+    Falls back to last-Thursday calculation if API unavailable.
     """
-    if (year, month) in NSE_EXPIRY_DATES:
-        return NSE_EXPIRY_DATES[(year, month)]
+    expiry_map = _load_nfo_expiries()
+    if (year, month) in expiry_map:
+        return expiry_map[(year, month)]
 
     # Fallback: last Thursday of month
     last_day  = calendar.monthrange(year, month)[1]
@@ -112,24 +102,54 @@ def get_contract_expiry(year: int, month: int) -> date:
     return last_date.replace(day=last_day - days_back)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Contract helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def strip_contract_suffix(symbol: str) -> str:
+    return _CONTRACT_RE.sub('', symbol)
+
+
+def is_index_future(symbol: str) -> bool:
+    return strip_contract_suffix(symbol) in INDEX_BASES
+
+
 def is_contract_expired(symbol: str, start_date_str: str) -> bool:
-    """
-    Returns True if the contract expired before start_date.
-    Uses NSE_EXPIRY_DATES for accuracy — not just last-Thursday formula.
-    """
     m = _CONTRACT_RE.search(symbol)
     if not m:
         return False
-
     suffix = m.group(0)
     yy     = int(suffix[:2])
     mon    = suffix[2:5].upper()
     month  = _MONTH_MAP.get(mon)
     if not month:
         return False
-
     expiry = get_contract_expiry(2000 + yy, month)
     return date.fromisoformat(start_date_str) > expiry
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# S3 helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_s3():
+    return boto3.client('s3',
+        aws_access_key_id=AWS_KEY,
+        aws_secret_access_key=AWS_SECRET,
+        region_name=AWS_REGION
+    )
+
+
+def _s3_list(prefix: str) -> list[str]:
+    try:
+        paginator = _get_s3().get_paginator('list_objects_v2')
+        keys = []
+        for page in paginator.paginate(Bucket=BUCKET_NAME, Prefix=prefix):
+            for obj in page.get('Contents', []):
+                keys.append(obj['Key'])
+        return keys
+    except Exception:
+        return []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -137,20 +157,11 @@ def is_contract_expired(symbol: str, start_date_str: str) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_lot_sizes() -> dict:
-    """
-    Load lot sizes from Zerodha API.
-    Returns {base_name: lot_size} e.g. {'CHOLAFIN': 625}.
-    Falls back to empty dict if API unavailable.
-    """
     try:
-        from scripts.auth import get_secret
-        from kiteconnect import KiteConnect
-        api_key      = get_secret("KITE_API_KEY")
-        access_token = get_secret("KITE_ACCESS_TOKEN")
-        kite = KiteConnect(api_key=api_key)
-        kite.set_access_token(access_token)
-        df = pd.DataFrame(kite.instruments("NFO"))
-        df = df[df["instrument_type"] == "FUT"]
+        from data.ingest.zerodha_client import ZerodhaClient
+        kite = ZerodhaClient().kite
+        df   = pd.DataFrame(kite.instruments("NFO"))
+        df   = df[df["instrument_type"] == "FUT"]
         return {row["name"]: int(row["lot_size"]) for _, row in df.iterrows()}
     except Exception as e:
         print(f"Could not load lot sizes ({e}) — using defaults")
@@ -158,53 +169,32 @@ def get_lot_sizes() -> dict:
 
 
 def get_symbols(start: str, end: str) -> list:
-    """
-    Return active symbols for a date range.
-
-    - Scans all contract directories in GCS
-    - Skips index futures
-    - Skips expired contracts using NSE_EXPIRY_DATES
-    - Skips contracts with no data in date range
-    - Returns one symbol per underlying (most recent active contract)
-    """
-    fs          = _get_s3_client()
-    all_entries = fs.glob(f"{BUCKET_NAME}/processed/features/*")
+    all_keys = _s3_list("processed/features/")
+    folders  = set()
+    for key in all_keys:
+        parts = key.split("/")
+        if len(parts) >= 3:
+            folders.add(parts[2])
 
     best: dict = {}
-
-    for entry in all_entries:
-        parts = entry.split("/")
-        if len(parts) < 4:
-            continue
-
-        candidate = parts[3]
-
+    for candidate in folders:
         if is_index_future(candidate):
             continue
         if not _CONTRACT_RE.search(candidate):
             continue
         if '.' in candidate or candidate.startswith('_'):
             continue
-
-        # Skip expired contracts
         if is_contract_expired(candidate, start):
             continue
 
-        base = strip_contract_suffix(candidate)
-
-        # Verify actual data files exist in date range
-        files = fs.glob(
-            f"{BUCKET_NAME}/processed/features/{candidate}/*.parquet"
-        )
+        base     = strip_contract_suffix(candidate)
+        files    = _s3_list(f"processed/features/{candidate}/")
         has_data = any(
-            start <= f.split("/")[-1].replace(".parquet", "") <= end
-            for f in files
+            start <= k.split("/")[-1].replace(".parquet", "") <= end
+            for k in files
         )
         if not has_data:
             continue
-
-        # Keep most recent contract per base name
-        # JUNFUT > MAYFUT alphabetically = correct
         if base not in best or candidate > best[base]:
             best[base] = candidate
 
@@ -213,30 +203,22 @@ def get_symbols(start: str, end: str) -> list:
 
 def resolve_params(symbol: str, global_params: dict,
                    use_optimal: bool, model: str) -> dict:
-    """
-    Return params for a symbol.
-    Contract roll handled via param_loader.get_symbol_params().
-    """
     if not use_optimal:
         return global_params
-
     opt    = get_symbol_params(symbol, model=model)
     merged = global_params.copy()
     merged['gamma']      = opt.get('gamma',      global_params['gamma'])
-    merged['kappa']      = opt.get('kappa',       global_params['kappa'])
-    merged['min_spread'] = opt.get('min_spread',  global_params['min_spread'])
-    merged['open_mult']  = opt.get('open_mult',   global_params['open_mult'])
-
+    merged['kappa']      = opt.get('kappa',      global_params['kappa'])
+    merged['min_spread'] = opt.get('min_spread', global_params['min_spread'])
+    merged['open_mult']  = opt.get('open_mult',  global_params['open_mult'])
     if model == 'v2':
         for k in ['phi', 'rho', 'beta', 'theta', 'eta', 'nu', 'zeta']:
             if k in opt:
                 merged[k] = opt[k]
-
     return merged
 
 
 def get_lot_size_for_symbol(symbol: str, lot_sizes: dict) -> int:
-    """Get lot size handling contract suffix."""
     base = strip_contract_suffix(symbol)
     if base in lot_sizes:
         return lot_sizes[base]
@@ -246,7 +228,7 @@ def get_lot_size_for_symbol(symbol: str, lot_sizes: dict) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# V1 — fast Numba runner
+# V1 runner
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_one_v1(symbol: str, start: str, end: str,
@@ -258,11 +240,9 @@ def run_one_v1(symbol: str, start: str, end: str,
     ) else 'equity_futures'
 
     try:
-        start_dt = datetime.strptime(start, '%Y-%m-%d')
-        end_dt   = datetime.strptime(end,   '%Y-%m-%d')
-        frames   = []
-        current  = start_dt
-
+        frames  = []
+        current = datetime.strptime(start, '%Y-%m-%d')
+        end_dt  = datetime.strptime(end,   '%Y-%m-%d')
         while current <= end_dt:
             date_str = current.strftime('%Y-%m-%d')
             df = load_day(symbol, date_str, market_hours_only=True)
@@ -273,32 +253,24 @@ def run_one_v1(symbol: str, start: str, end: str,
 
         if not frames:
             return {'symbol': symbol, 'lot_size': lot_size,
-                    'net_pnl': 0, 'bars': 0, 'ok': False,
-                    'error': 'no data'}
+                    'net_pnl': 0, 'bars': 0, 'ok': False, 'error': 'no data'}
 
         full_df = pd.concat(frames, ignore_index=True).sort_values('ts_sec')
-
         if len(full_df) < min_bars:
             return {'symbol': symbol, 'lot_size': lot_size,
                     'net_pnl': 0, 'bars': len(full_df), 'ok': False,
                     'error': f'only {len(full_df)} bars'}
 
         result = run_fast_backtest(
-            df               = full_df,
-            gamma            = params['gamma'],
-            kappa            = params['kappa'],
-            min_spread       = params['min_spread'],
-            max_spread       = params['max_spread'],
-            open_mult        = params.get('open_mult', 2.0),
-            lot_size         = lot_size,
-            max_inventory    = params.get('max_inv', 5),
-            queue_aggression = params.get('queue_agg', 0.3),
-            instrument_type  = inst,
+            df=full_df, gamma=params['gamma'], kappa=params['kappa'],
+            min_spread=params['min_spread'], max_spread=params['max_spread'],
+            open_mult=params.get('open_mult', 2.0), lot_size=lot_size,
+            max_inventory=params.get('max_inv', 5),
+            queue_aggression=params.get('queue_agg', 0.3),
+            instrument_type=inst,
         )
-
         return {
-            'symbol':    symbol,
-            'lot_size':  lot_size,
+            'symbol': symbol, 'lot_size': lot_size,
             'gross_pnl': round(result.gross_pnl, 2),
             'costs':     round(result.total_costs, 2),
             'net_pnl':   round(result.net_pnl, 2),
@@ -308,19 +280,17 @@ def run_one_v1(symbol: str, start: str, end: str,
             'sharpe':    result.sharpe_ratio,
             'max_dd':    result.max_drawdown,
             'bars':      result.bars_processed,
-            'ok':        True,
-            'gamma':     params['gamma'],
+            'ok': True,
+            'gamma': params['gamma'],
             'open_mult': params.get('open_mult', 2.0),
         }
-
     except Exception as e:
         return {'symbol': symbol, 'lot_size': lot_size,
-                'net_pnl': 0, 'bars': 0, 'ok': False,
-                'error': str(e)[:80]}
+                'net_pnl': 0, 'bars': 0, 'ok': False, 'error': str(e)[:80]}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# V2 — fast Numba V2 runner
+# V2 runner
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_one_v2(symbol: str, start: str, end: str,
@@ -334,11 +304,9 @@ def run_one_v2(symbol: str, start: str, end: str,
     ) else 'equity_futures'
 
     try:
-        start_dt = datetime.strptime(start, '%Y-%m-%d')
-        end_dt   = datetime.strptime(end,   '%Y-%m-%d')
-        frames   = []
-        current  = start_dt
-
+        frames  = []
+        current = datetime.strptime(start, '%Y-%m-%d')
+        end_dt  = datetime.strptime(end,   '%Y-%m-%d')
         while current <= end_dt:
             date_str = current.strftime('%Y-%m-%d')
             df = load_day(symbol, date_str, market_hours_only=True)
@@ -349,43 +317,34 @@ def run_one_v2(symbol: str, start: str, end: str,
 
         if not frames:
             return {'symbol': symbol, 'lot_size': lot_size,
-                    'net_pnl': 0, 'bars': 0, 'ok': False,
-                    'error': 'no data'}
+                    'net_pnl': 0, 'bars': 0, 'ok': False, 'error': 'no data'}
 
         full_df = pd.concat(frames, ignore_index=True).sort_values('ts_sec')
-
         if len(full_df) < min_bars:
             return {'symbol': symbol, 'lot_size': lot_size,
                     'net_pnl': 0, 'bars': len(full_df), 'ok': False,
                     'error': f'only {len(full_df)} bars'}
 
         result = run_fast_v2_backtest(
-            df                   = full_df,
-            beta                 = params.get('beta',          1.0),
-            theta                = params.get('theta',         2.0),
-            eta                  = params.get('eta',           0.5),
-            nu                   = params.get('nu',            0.2),
-            rho                  = params.get('rho',           0.30),
-            zeta                 = params.get('zeta',          0.5),
-            epsilon_plus         = params.get('epsilon_plus',  0.002),
-            epsilon_minus        = params.get('epsilon_minus', 0.002),
-            beta_kappa           = params.get('beta_kappa',    0.5),
-            theta_kappa          = params.get('theta_kappa',   1.5),
-            eta_kappa            = params.get('eta_kappa',     0.3),
-            nu_kappa             = params.get('nu_kappa',      0.1),
-            phi                  = params.get('phi',           0.001),
-            min_spread           = params['min_spread'],
-            max_spread           = params['max_spread'],
-            open_mult            = params.get('open_mult',     2.0),
-            lot_size             = lot_size,
-            max_inventory        = params.get('max_inv',       5),
-            classifier_threshold = params.get('classifier_threshold', 0.50),
-            instrument_type      = inst,
+            df=full_df,
+            beta=params.get('beta', 1.0), theta=params.get('theta', 2.0),
+            eta=params.get('eta', 0.5), nu=params.get('nu', 0.2),
+            rho=params.get('rho', 0.30), zeta=params.get('zeta', 0.5),
+            epsilon_plus=params.get('epsilon_plus', 0.002),
+            epsilon_minus=params.get('epsilon_minus', 0.002),
+            beta_kappa=params.get('beta_kappa', 0.5),
+            theta_kappa=params.get('theta_kappa', 1.5),
+            eta_kappa=params.get('eta_kappa', 0.3),
+            nu_kappa=params.get('nu_kappa', 0.1),
+            phi=params.get('phi', 0.001),
+            min_spread=params['min_spread'], max_spread=params['max_spread'],
+            open_mult=params.get('open_mult', 2.0), lot_size=lot_size,
+            max_inventory=params.get('max_inv', 5),
+            classifier_threshold=params.get('classifier_threshold', 0.50),
+            instrument_type=inst,
         )
-
         return {
-            'symbol':    symbol,
-            'lot_size':  lot_size,
+            'symbol': symbol, 'lot_size': lot_size,
             'gross_pnl': round(result.gross_pnl, 2),
             'costs':     round(result.total_costs, 2),
             'net_pnl':   round(result.net_pnl, 2),
@@ -395,13 +354,11 @@ def run_one_v2(symbol: str, start: str, end: str,
             'sharpe':    result.sharpe_ratio,
             'max_dd':    result.max_drawdown,
             'bars':      result.bars_processed,
-            'ok':        True,
+            'ok': True,
         }
-
     except Exception as e:
         return {'symbol': symbol, 'lot_size': lot_size,
-                'net_pnl': 0, 'bars': 0, 'ok': False,
-                'error': str(e)[:80]}
+                'net_pnl': 0, 'bars': 0, 'ok': False, 'error': str(e)[:80]}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -417,27 +374,21 @@ def print_results(results: list, errors: list,
 
     results.sort(key=lambda x: x['net_pnl'], reverse=True)
     profitable = [r for r in results if r['net_pnl'] > 0]
-
-    opt_tag = " [OPTIMIZED PARAMS]" if use_optimal else ""
+    opt_tag    = " [OPTIMIZED PARAMS]" if use_optimal else ""
 
     print(f"\n{'='*80}")
-    print(f"  FULL RANKING -- {len(results)} symbols  "
-          f"[Model: {model.upper()}{opt_tag}]")
+    print(f"  FULL RANKING -- {len(results)} symbols  [Model: {model.upper()}{opt_tag}]")
     print(f"{'='*80}")
-    print(f"\n  {'#':>3} {'Symbol':<25} {'Lot':>4} "
-          f"{'Gross':>11} {'Costs':>10} {'Net':>11} "
-          f"{'Win%':>6} {'Sharpe':>7}")
+    print(f"\n  {'#':>3} {'Symbol':<25} {'Lot':>4} {'Gross':>11} {'Costs':>10} {'Net':>11} {'Win%':>6} {'Sharpe':>7}")
     print("  " + "-"*80)
 
     for i, r in enumerate(results, 1):
         sign   = "+" if r['net_pnl'] >= 0 else ""
         marker = " ✓" if r['net_pnl'] > 0 else ""
         print(f"  {i:>3} {r['symbol']:<25} {r['lot_size']:>4} "
-              f"Rs.{r['gross_pnl']:>9,.0f} "
-              f"Rs.{r['costs']:>8,.0f} "
+              f"Rs.{r['gross_pnl']:>9,.0f} Rs.{r['costs']:>8,.0f} "
               f"Rs.{sign}{r['net_pnl']:>9,.0f} "
-              f"{r['win_rate']:>5.1f}% "
-              f"{r['sharpe']:>7.2f}{marker}")
+              f"{r['win_rate']:>5.1f}% {r['sharpe']:>7.2f}{marker}")
 
     print(f"\n{'='*80}")
     print(f"  PROFITABLE: {len(profitable)} / {len(results)} symbols")
@@ -446,14 +397,10 @@ def print_results(results: list, errors: list,
     if profitable:
         total = sum(r['net_pnl'] for r in profitable)
         print(f"  Combined net PnL if trading all: Rs.+{total:,.0f}\n")
-        print(f"  {'Symbol':<25} {'Lot':>4} {'Net PnL':>12} "
-              f"{'Fills':>7} {'Win%':>6} {'MaxDD':>12}")
-        print("  " + "-"*72)
         for r in profitable:
             print(f"  {r['symbol']:<25} {r['lot_size']:>4} "
                   f"Rs.+{r['net_pnl']:>10,.0f} "
-                  f"{r['fills']:>7} "
-                  f"{r['win_rate']:>5.1f}% "
+                  f"{r['fills']:>7} {r['win_rate']:>5.1f}% "
                   f"-Rs.{abs(r['max_dd']):>9,.0f}")
 
     if errors:
@@ -472,12 +419,11 @@ def print_results(results: list, errors: list,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Batch backtest — all stock futures (V1 fast or V2 Ricci)"
+        description="Batch backtest — all stock futures"
     )
     parser.add_argument("--start",              default="2026-05-27")
     parser.add_argument("--end",                default="2026-05-27")
-    parser.add_argument("--model",              default="v1",
-                        choices=["v1", "v2"])
+    parser.add_argument("--model",              default="v1", choices=["v1", "v2"])
     parser.add_argument("--use-optimal-params", action="store_true")
     parser.add_argument("--min-bars",           type=int,   default=100)
     parser.add_argument("--workers",            type=int,   default=8)
@@ -495,52 +441,33 @@ def main():
     parser.add_argument("--eta",   type=float, default=0.5)
     parser.add_argument("--nu",    type=float, default=0.2)
     parser.add_argument("--zeta",  type=float, default=0.5)
-
     args = parser.parse_args()
 
     global_params = {
-        'gamma':      args.gamma,
-        'kappa':      args.kappa,
-        'min_spread': args.min_spread,
-        'max_spread': args.max_spread,
-        'open_mult':  args.open_mult,
-        'queue_agg':  args.queue_aggression,
-        'max_inv':    args.max_inventory,
-        'phi':        args.phi,
-        'rho':        args.rho,
-        'beta':       args.beta,
-        'theta':      args.theta,
-        'eta':        args.eta,
-        'nu':         args.nu,
-        'zeta':       args.zeta,
+        'gamma': args.gamma, 'kappa': args.kappa,
+        'min_spread': args.min_spread, 'max_spread': args.max_spread,
+        'open_mult': args.open_mult, 'queue_agg': args.queue_aggression,
+        'max_inv': args.max_inventory, 'phi': args.phi, 'rho': args.rho,
+        'beta': args.beta, 'theta': args.theta, 'eta': args.eta,
+        'nu': args.nu, 'zeta': args.zeta,
     }
 
     t0      = time.perf_counter()
     opt_tag = " [OPTIMIZED PARAMS]" if args.use_optimal_params else ""
 
     print(f"\n{'='*70}")
-    print(f"  Batch Backtest — All Stock Futures  "
-          f"[Model: {args.model.upper()}{opt_tag}]")
+    print(f"  Batch Backtest — All Stock Futures  [Model: {args.model.upper()}{opt_tag}]")
     print(f"  Period:  {args.start} -> {args.end}")
-    if not args.use_optimal_params:
-        if args.model == 'v1':
-            print(f"  Params:  gamma={args.gamma} "
-                  f"min_spread={args.min_spread} "
-                  f"kappa={args.kappa} open_mult={args.open_mult}")
-        else:
-            print(f"  Params:  phi={args.phi} rho={args.rho} "
-                  f"beta={args.beta} eta={args.eta} nu={args.nu}")
-    else:
-        print(f"  Params:  Per-symbol from "
-              f"research/findings/{args.model}_optimal_params.json")
-        print(f"           Fallback: gamma={args.gamma} "
-              f"min_spread={args.min_spread}")
     print(f"  Workers: {args.workers}")
 
-    # Show expiry dates for verification
-    may_exp = get_contract_expiry(2026, 5)
-    jun_exp = get_contract_expiry(2026, 6)
-    print(f"  Expiries: MAY={may_exp}  JUN={jun_exp}")
+    # Dynamic expiry dates
+    cur_month = datetime.now()
+    exp1 = get_contract_expiry(cur_month.year, cur_month.month)
+    next_month = cur_month.month % 12 + 1
+    next_year  = cur_month.year + (1 if next_month == 1 else 0)
+    exp2 = get_contract_expiry(next_year, next_month)
+    print(f"  Expiries: {cur_month.strftime('%b').upper()}={exp1}  "
+          f"{datetime(next_year, next_month, 1).strftime('%b').upper()}={exp2}")
     print(f"{'='*70}\n")
 
     print("Loading lot sizes...")
@@ -557,11 +484,9 @@ def main():
     results = []
     errors  = []
     counter = [0]
-
     run_one = run_one_v1 if args.model == 'v1' else run_one_v2
 
-    print(f"{'#':>3} {'Symbol':<30} {'NetPnL':>12} "
-          f"{'Fills':>6} {'Win%':>6} {'Sharpe':>7}")
+    print(f"{'#':>3} {'Symbol':<30} {'NetPnL':>12} {'Fills':>6} {'Win%':>6} {'Sharpe':>7}")
     print("-"*65)
 
     def handle_result(r):
@@ -569,36 +494,26 @@ def main():
         i = counter[0]
         if not r['ok']:
             errors.append(r)
-            print(f"{i:>3} {r['symbol']:<30}  "
-                  f"SKIP ({r.get('error', '')[:40]})")
+            print(f"{i:>3} {r['symbol']:<30}  SKIP ({r.get('error', '')[:40]})")
             return
         results.append(r)
         sign = "+" if r['net_pnl'] >= 0 else ""
         print(f"{i:>3} {r['symbol']:<30}  "
               f"Rs.{sign}{r['net_pnl']:>9,.0f}  "
-              f"{r['fills']:>5}  "
-              f"{r['win_rate']:>5.1f}%  "
-              f"{r['sharpe']:>6.2f}")
+              f"{r['fills']:>5}  {r['win_rate']:>5.1f}%  {r['sharpe']:>6.2f}")
 
     def run_with_resolved_params(sym):
-        p = resolve_params(sym, global_params,
-                           args.use_optimal_params, args.model)
-        return run_one(sym, args.start, args.end,
-                       lot_sizes, p, args.min_bars)
+        p = resolve_params(sym, global_params, args.use_optimal_params, args.model)
+        return run_one(sym, args.start, args.end, lot_sizes, p, args.min_bars)
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures_map = {
-            pool.submit(run_with_resolved_params, sym): sym
-            for sym in symbols
-        }
+        futures_map = {pool.submit(run_with_resolved_params, sym): sym for sym in symbols}
         for future in as_completed(futures_map):
             handle_result(future.result())
 
     elapsed = time.perf_counter() - t0
-    print_results(results, errors, len(symbols),
-                  args.model, args.use_optimal_params)
-    print(f"  Total time: {elapsed:.1f}s  "
-          f"({elapsed/max(len(symbols),1):.2f}s per symbol)\n")
+    print_results(results, errors, len(symbols), args.model, args.use_optimal_params)
+    print(f"  Total time: {elapsed:.1f}s  ({elapsed/max(len(symbols),1):.2f}s per symbol)\n")
 
 
 if __name__ == "__main__":
@@ -606,74 +521,37 @@ if __name__ == "__main__":
 
 
 def run_backtest_all(
-    model:              str   = 'v1',
-    start_date:         str   = None,
-    end_date:           str   = None,
-    symbols:            list  = None,
-    use_optimal_params: bool  = True,
-    workers:            int   = 8,
+    model:              str  = 'v1',
+    start_date:         str  = None,
+    end_date:           str  = None,
+    symbols:            list = None,
+    use_optimal_params: bool = True,
+    workers:            int  = 8,
 ) -> list:
-    """
-    Library entry point for qf.py CLI.
- 
-    Same logic as main() but returns results list instead of printing.
-    qf.py handles all display and formatting.
- 
-    Args:
-        model:              'v1' or 'v2'
-        start_date:         'YYYY-MM-DD'
-        end_date:           'YYYY-MM-DD'
-        symbols:            list of symbols (default: auto-detect all)
-        use_optimal_params: use per-symbol optimized params
-        workers:            parallel threads
- 
-    Returns:
-        List of result dicts with keys:
-            symbol, lot_size, net_pnl, gross_pnl, costs,
-            fills, win_rate, sharpe, max_dd, bars, ok
-    """
     global_params = {
-        'gamma':      0.001,
-        'kappa':      1.5,
-        'min_spread': 0.10,
-        'max_spread': 10.0,
-        'open_mult':  2.0,
-        'queue_agg':  0.3,
-        'max_inv':    5,
-        'phi':        0.001,
-        'rho':        0.30,
-        'beta':       1.0,
-        'theta':      2.0,
-        'eta':        0.5,
-        'nu':         0.2,
-        'zeta':       0.5,
+        'gamma': 0.001, 'kappa': 1.5, 'min_spread': 0.10,
+        'max_spread': 10.0, 'open_mult': 2.0, 'queue_agg': 0.3,
+        'max_inv': 5, 'phi': 0.001, 'rho': 0.30, 'beta': 1.0,
+        'theta': 2.0, 'eta': 0.5, 'nu': 0.2, 'zeta': 0.5,
     }
- 
-    # Load lot sizes
     lot_sizes = get_lot_sizes()
- 
-    # Get symbols
     if symbols is None:
         symbols = get_symbols(start_date, end_date)
- 
     if not symbols:
         return []
- 
+
     run_one = run_one_v1 if model == 'v1' else run_one_v2
- 
     results = []
- 
-    from concurrent.futures import ThreadPoolExecutor, as_completed
- 
+
     def run_sym(sym):
         p = resolve_params(sym, global_params, use_optimal_params, model)
         return run_one(sym, start_date, end_date, lot_sizes, p)
- 
+
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(run_sym, sym): sym for sym in symbols}
         for future in as_completed(futures):
             r = future.result()
             if r['ok']:
                 results.append(r)
- 
+
     return sorted(results, key=lambda x: x['net_pnl'], reverse=True)
