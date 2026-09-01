@@ -9,16 +9,16 @@ from data.ingest.candle_builder import CandleBuilder
 from data.ingest.instrument_manager import InstrumentManager
 
 def main():
-    manager          = InstrumentManager()
+    manager           = InstrumentManager()
+    manager.get_all_instruments()
     tokens, token_map = manager.get_tokens_and_symbols()
-    symbols          = list(token_map.values())
 
     print(f"Trading {len(tokens)} instruments:")
     for t, s in token_map.items():
         print(f"  {s} ({t})")
 
     collector = TickCollector(instrument_tokens=tokens)
-    builder   = CandleBuilder(symbols=symbols, interval_seconds=60)
+    builder   = CandleBuilder(token_map=token_map, interval_seconds=60)
 
     def shutdown(sig, frame):
         print("\nShutting down...")

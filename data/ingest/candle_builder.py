@@ -17,15 +17,15 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class CandleBuilder:
-    def __init__(self, symbols: list, interval_seconds: int = 60):
-        self.symbols          = symbols
+    def __init__(self, token_map: dict, interval_seconds: int = 60):
+        self.token_map        = token_map  # {token_int: symbol_name}
         self.interval_seconds = interval_seconds
         self.redis            = RedisClient()
         self.s3               = S3Client()
         self._running         = False
 
-    def _build_candle(self, symbol: str) -> dict | None:
-        raw = self.redis.get_stream(symbol, count=500)
+    def _build_candle(self, token: str) -> dict | None:
+        raw = self.redis.get_stream(token, count=500)
         if not raw:
             return None
 
@@ -61,7 +61,6 @@ class CandleBuilder:
         spread    = df['ask_p1'] - df['bid_p1']
 
         candle = {
-            'symbol':            symbol,
             'timestamp':         datetime.now(timezone.utc).isoformat(),
             'open':              df['ltp'].iloc[-1],
             'high':              df['ltp'].max(),
@@ -99,23 +98,30 @@ class CandleBuilder:
         date_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
         s3_key   = f"live/candles/1minute/{symbol}/{date_str}.parquet"
 
-        with tempfile.NamedTemporaryFile(suffix='.parquet', delete=False) as tmp:
-            tmp_path = tmp.name
-        try:
-            table = pa.Table.from_pandas(df)
-            pq.write_table(table, tmp_path)
-            self.s3.upload(tmp_path, s3_key)
-            logger.info(f"Flushed candle for {symbol} to S3")
-        finally:
-            os.unlink(tmp_path)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path    = os.path.join(tmpdir, 'candle.parquet')
+            merged_path = os.path.join(tmpdir, 'merged.parquet')
+
+            try:
+                self.s3.download(s3_key, tmp_path)
+                existing_df = pd.read_parquet(tmp_path)
+                merged_df   = pd.concat([existing_df, df], ignore_index=True)
+            except Exception:
+                merged_df = df
+
+            table = pa.Table.from_pandas(merged_df)
+            pq.write_table(table, merged_path)
+            self.s3.upload(merged_path, s3_key)
+            logger.info(f"Flushed candle for {symbol} — {len(merged_df)} total today")
 
     def _run_loop(self):
         while self._running:
             time.sleep(self.interval_seconds)
-            for symbol in self.symbols:
+            for token, symbol in self.token_map.items():
                 try:
-                    candle = self._build_candle(symbol)
+                    candle = self._build_candle(str(token))
                     if candle:
+                        candle['symbol'] = symbol
                         self._flush_to_s3(symbol, candle)
                 except Exception as e:
                     logger.error(f"Candle build failed for {symbol}: {e}")
@@ -124,7 +130,7 @@ class CandleBuilder:
         self._running = True
         thread = threading.Thread(target=self._run_loop, daemon=True)
         thread.start()
-        logger.info(f"Candle builder started for {self.symbols}")
+        logger.info(f"Candle builder started for {len(self.token_map)} instruments")
 
     def stop(self):
         self._running = False
