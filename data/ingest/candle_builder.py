@@ -7,6 +7,7 @@ import logging
 import threading
 import time
 from datetime import datetime, timezone
+from collections import defaultdict
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -16,16 +17,21 @@ from data.store.s3_client import S3Client
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class CandleBuilder:
-    def __init__(self, token_map: dict, interval_seconds: int = 60):
-        self.token_map        = token_map  # {token_int: symbol_name}
-        self.interval_seconds = interval_seconds
-        self.redis            = RedisClient()
-        self.s3               = S3Client()
-        self._running         = False
 
-    def _build_candle(self, token: str) -> dict | None:
-        raw = self.redis.get_stream(token, count=500)
+class CandleBuilder:
+    def __init__(self, token_map: dict, flush_interval: int = 60):
+        self.token_map      = token_map  # {token_int: symbol_name}
+        self.flush_interval = flush_interval
+        self.redis          = RedisClient()
+        self.s3             = S3Client()
+        self._running       = False
+        # In-memory buffer: {symbol: [candle_dict, ...]}
+        self._buffer        = defaultdict(list)
+        self._buffer_lock   = threading.Lock()
+
+    def _build_1s_candle(self, token: str, symbol: str) -> dict | None:
+        """Build one 1-second candle from current Redis stream snapshot."""
+        raw = self.redis.get_stream(token, count=50)
         if not raw:
             return None
 
@@ -60,78 +66,117 @@ class CandleBuilder:
         imbalance = (total_bid - total_ask) / (total_bid + total_ask + 1e-9)
         spread    = df['ask_p1'] - df['bid_p1']
 
-        candle = {
-            'timestamp':         datetime.now(timezone.utc).isoformat(),
-            'open':              df['ltp'].iloc[-1],
-            'high':              df['ltp'].max(),
-            'low':               df['ltp'].min(),
-            'close':             df['ltp'].iloc[0],
-            'vwap':              (df['ltp'] * df['volume']).sum() / (df['volume'].sum() + 1e-9),
-            'volume_open':       df['volume'].iloc[-1],
-            'volume_close':      df['volume'].iloc[0],
-            'volume_delta':      df['volume'].iloc[0] - df['volume'].iloc[-1],
-            'oi_open':           df['oi'].iloc[-1],
-            'oi_close':          df['oi'].iloc[0],
-            'oi_delta':          df['oi'].iloc[0] - df['oi'].iloc[-1],
-            'avg_imbalance':     imbalance.mean(),
-            'max_imbalance':     imbalance.max(),
-            'min_imbalance':     imbalance.min(),
-            'avg_spread':        spread.mean(),
-            'min_spread':        spread.min(),
-            'avg_bid_qty_top':   df['bid_q1'].mean(),
-            'avg_ask_qty_top':   df['ask_q1'].mean(),
-            'avg_total_bid_qty': total_bid.mean(),
-            'avg_total_ask_qty': total_ask.mean(),
-            'avg_bid_qty_l2':    df['bid_q2'].mean(),
-            'avg_ask_qty_l2':    df['ask_q2'].mean(),
-            'avg_bid_qty_l3':    df['bid_q3'].mean(),
-            'avg_ask_qty_l3':    df['ask_q3'].mean(),
-            'avg_bid_qty_l4':    df['bid_q4'].mean(),
-            'avg_ask_qty_l4':    df['ask_q4'].mean(),
-            'avg_bid_qty_l5':    df['bid_q5'].mean(),
-            'avg_ask_qty_l5':    df['ask_q5'].mean(),
+        return {
+            'symbol':            symbol,
+            'ts_sec':            int(datetime.now(timezone.utc).timestamp()),
+            'ts_ist':            datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
+            'open':              float(df['ltp'].iloc[-1]),
+            'high':              float(df['ltp'].max()),
+            'low':               float(df['ltp'].min()),
+            'close':             float(df['ltp'].iloc[0]),
+            'vwap':              float((df['ltp'] * df['volume']).sum() / (df['volume'].sum() + 1e-9)),
+            'volume_delta':      float(df['volume'].iloc[0] - df['volume'].iloc[-1]),
+            'oi':                float(df['oi'].iloc[0]),
+            'tick_count':        len(rows),
+            'imbalance_last':    float(imbalance.iloc[0]),
+            'imbalance_mean':    float(imbalance.mean()),
+            'spread_mean':       float(spread.mean()),
+            'weighted_mid':      float((df['bid_p1'].iloc[0] * df['ask_q1'].iloc[0] +
+                                       df['ask_p1'].iloc[0] * df['bid_q1'].iloc[0]) /
+                                      (df['bid_q1'].iloc[0] + df['ask_q1'].iloc[0] + 1e-9)),
+            'total_bid_qty':     float(total_bid.iloc[0]),
+            'total_ask_qty':     float(total_ask.iloc[0]),
+            'bid_p1':            float(df['bid_p1'].iloc[0]),
+            'bid_q1':            float(df['bid_q1'].iloc[0]),
+            'bid_p2':            float(df['bid_p2' if 'bid_p2' in df else 'bid_p1'].iloc[0]) if 'bid_p2' in df.columns else 0.0,
+            'bid_q2':            float(df['bid_q2'].iloc[0]) if 'bid_q2' in df.columns else 0.0,
+            'bid_p3':            float(df['bid_p3'].iloc[0]) if 'bid_p3' in df.columns else 0.0,
+            'bid_q3':            float(df['bid_q3'].iloc[0]) if 'bid_q3' in df.columns else 0.0,
+            'bid_p4':            float(df['bid_p4'].iloc[0]) if 'bid_p4' in df.columns else 0.0,
+            'bid_q4':            float(df['bid_q4'].iloc[0]) if 'bid_q4' in df.columns else 0.0,
+            'bid_p5':            float(df['bid_p5'].iloc[0]) if 'bid_p5' in df.columns else 0.0,
+            'bid_q5':            float(df['bid_q5'].iloc[0]) if 'bid_q5' in df.columns else 0.0,
+            'ask_p1':            float(df['ask_p1'].iloc[0]),
+            'ask_q1':            float(df['ask_q1'].iloc[0]),
+            'ask_p2':            float(df['ask_p2'].iloc[0]) if 'ask_p2' in df.columns else 0.0,
+            'ask_q2':            float(df['ask_q2'].iloc[0]) if 'ask_q2' in df.columns else 0.0,
+            'ask_p3':            float(df['ask_p3'].iloc[0]) if 'ask_p3' in df.columns else 0.0,
+            'ask_q3':            float(df['ask_q3'].iloc[0]) if 'ask_q3' in df.columns else 0.0,
+            'ask_p4':            float(df['ask_p4'].iloc[0]) if 'ask_p4' in df.columns else 0.0,
+            'ask_q4':            float(df['ask_q4'].iloc[0]) if 'ask_q4' in df.columns else 0.0,
+            'ask_p5':            float(df['ask_p5'].iloc[0]) if 'ask_p5' in df.columns else 0.0,
+            'ask_q5':            float(df['ask_q5'].iloc[0]) if 'ask_q5' in df.columns else 0.0,
         }
-        return candle
 
-    def _flush_to_s3(self, symbol: str, candle: dict):
-        df       = pd.DataFrame([candle])
+    def _flush_buffer_to_s3(self):
+        """Flush all buffered 1-second candles to S3."""
+        with self._buffer_lock:
+            buffer_copy = dict(self._buffer)
+            self._buffer.clear()
+
+        if not buffer_copy:
+            return
+
         date_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-        s3_key   = f"live/candles/1minute/{symbol}/{date_str}.parquet"
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path    = os.path.join(tmpdir, 'candle.parquet')
-            merged_path = os.path.join(tmpdir, 'merged.parquet')
-
+        for symbol, candles in buffer_copy.items():
+            if not candles:
+                continue
             try:
-                self.s3.download(s3_key, tmp_path)
-                existing_df = pd.read_parquet(tmp_path)
-                merged_df   = pd.concat([existing_df, df], ignore_index=True)
-            except Exception:
-                merged_df = df
+                new_df  = pd.DataFrame(candles)
+                s3_key  = f"live/candles/1second/{symbol}/{date_str}.parquet"
 
-            table = pa.Table.from_pandas(merged_df)
-            pq.write_table(table, merged_path)
-            self.s3.upload(merged_path, s3_key)
-            logger.info(f"Flushed candle for {symbol} — {len(merged_df)} total today")
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    tmp_path    = os.path.join(tmpdir, 'new.parquet')
+                    merged_path = os.path.join(tmpdir, 'merged.parquet')
 
-    def _run_loop(self):
+                    try:
+                        self.s3.download(s3_key, tmp_path)
+                        existing_df = pd.read_parquet(tmp_path)
+                        merged_df   = pd.concat([existing_df, new_df], ignore_index=True)
+                    except Exception:
+                        merged_df = new_df
+
+                    table = pa.Table.from_pandas(merged_df)
+                    pq.write_table(table, merged_path)
+                    self.s3.upload(merged_path, s3_key)
+
+                logger.info(f"Flushed {len(candles)} 1s bars for {symbol} — {len(merged_df)} total today")
+            except Exception as e:
+                logger.error(f"Flush failed for {symbol}: {e}")
+
+    def _collect_loop(self):
+        """Every second — build 1s candle for all instruments and buffer it."""
         while self._running:
-            time.sleep(self.interval_seconds)
+            start = time.time()
             for token, symbol in self.token_map.items():
                 try:
-                    candle = self._build_candle(str(token))
+                    candle = self._build_1s_candle(str(token), symbol)
                     if candle:
-                        candle['symbol'] = symbol
-                        self._flush_to_s3(symbol, candle)
+                        with self._buffer_lock:
+                            self._buffer[symbol].append(candle)
                 except Exception as e:
-                    logger.error(f"Candle build failed for {symbol}: {e}")
+                    logger.error(f"1s candle build failed for {symbol}: {e}")
+
+            elapsed = time.time() - start
+            sleep_time = max(0, 1.0 - elapsed)
+            time.sleep(sleep_time)
+
+    def _flush_loop(self):
+        """Every 60 seconds — flush buffer to S3."""
+        while self._running:
+            time.sleep(self.flush_interval)
+            self._flush_buffer_to_s3()
 
     def start(self):
         self._running = True
-        thread = threading.Thread(target=self._run_loop, daemon=True)
-        thread.start()
-        logger.info(f"Candle builder started for {len(self.token_map)} instruments")
+        collect_thread = threading.Thread(target=self._collect_loop, daemon=True)
+        flush_thread   = threading.Thread(target=self._flush_loop,   daemon=True)
+        collect_thread.start()
+        flush_thread.start()
+        logger.info(f"Candle builder started — 1s bars, flush every {self.flush_interval}s")
 
     def stop(self):
         self._running = False
+        self._flush_buffer_to_s3()  # final flush
         logger.info("Candle builder stopped")
