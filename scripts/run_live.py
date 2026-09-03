@@ -18,7 +18,7 @@ def main():
         print(f"  {s} ({t})")
 
     collector = TickCollector(instrument_tokens=tokens)
-    builder   = CandleBuilder(token_map=token_map, interval_seconds=60)
+    builder   = CandleBuilder(token_map=token_map, flush_interval=60)
 
     def shutdown(sig, frame):
         print("\nShutting down...")
