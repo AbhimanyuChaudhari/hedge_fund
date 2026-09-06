@@ -1,0 +1,2 @@
+after getting enough data you need to optimize the glft model, the inventory risk management 
+system and find out those constants for each instrument
