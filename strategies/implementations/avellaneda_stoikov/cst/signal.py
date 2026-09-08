@@ -16,8 +16,8 @@ from strategies.implementations.avellaneda_stoikov.cst.drift import DriftEstimat
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-MARKET_OPEN  = 9 * 3600 + 15 * 60
-MARKET_CLOSE = 15 * 3600 + 30 * 60
+MARKET_OPEN  = 9 * 3600
+MARKET_CLOSE = 17 * 3600
 SESSION_SECS = MARKET_CLOSE - MARKET_OPEN
 
 
@@ -48,46 +48,68 @@ class CSTSignalGenerator:
         return (utc_sec + 19800) % 86400
 
     def _time_remaining(self) -> float:
-        ist = self._ist_seconds()
+        ist       = self._ist_seconds()
         remaining = max(MARKET_CLOSE - ist, 1)
         return remaining / SESSION_SECS
 
     def _get_bars(self, count: int = 60) -> list[dict]:
-        """Get last N 1-second bars from Redis stream."""
-        raw = self.redis.get_stream(self.token, count=count)
+        """
+        Get last N 1-second bars from Redis stream.
+        Includes all 5 LOB levels for Cont-Kukanov-Stoikov weighted OFI.
+        """
+        raw  = self.redis.get_stream(self.token, count=count)
         bars = []
         for _, fields in raw:
-            bars.append({
+            bar = {
                 'close':          float(fields.get('ltp',           0)),
                 'volume_delta':   float(fields.get('volume',        0)),
                 'total_bid_qty':  float(fields.get('total_bid_qty', 0)),
                 'total_ask_qty':  float(fields.get('total_ask_qty', 0)),
-                'imbalance_last': float(fields.get('total_bid_qty', 0) - 
-                                        float(fields.get('total_ask_qty', 0))) /
-                                  (float(fields.get('total_bid_qty', 0)) + 
-                                   float(fields.get('total_ask_qty', 0)) + 1e-9),
-            })
+                'imbalance_last': (
+                    float(fields.get('total_bid_qty', 0)) -
+                    float(fields.get('total_ask_qty', 0))
+                ) / (
+                    float(fields.get('total_bid_qty', 0)) +
+                    float(fields.get('total_ask_qty', 0)) + 1e-9
+                ),
+            }
+            # All 5 LOB levels for weighted OFI
+            for i in range(1, 6):
+                bar[f'bid_p{i}'] = float(fields.get(f'bid_p{i}', 0))
+                bar[f'bid_q{i}'] = float(fields.get(f'bid_q{i}', 0))
+                bar[f'ask_p{i}'] = float(fields.get(f'ask_p{i}', 0))
+                bar[f'ask_q{i}'] = float(fields.get(f'ask_q{i}', 0))
+            bars.append(bar)
         return bars
 
     def _compute_sigma(self, bars: list[dict]) -> float:
-        """Fresh σ from last 60 ticks."""
+        """Fresh σ from last 60 ticks in price units."""
         prices = [b['close'] for b in bars if b['close'] > 0]
         if len(prices) < 2:
             return self.params.sigma
         log_returns = np.diff(np.log(prices))
-        return float(np.std(log_returns) * np.sqrt(len(prices)))
+        sigma_log   = float(np.std(log_returns) * np.sqrt(len(prices)))
+        # Convert to price units
+        last_price  = prices[-1] if prices else 1.0
+        return sigma_log * last_price
 
     def _recalibrate(self, bars: list[dict]):
-        """Recalibrate flow rates and drift every 10 seconds."""
+        """
+        Recalibrate order flow rates and drift every recalib_secs seconds.
+        Uses Cont-Kukanov-Stoikov weighted OFI for drift estimation.
+        """
         now = time.time()
         if now - self._last_calib < self.params.recalib_secs:
             return
+
         self._cached_flow = self.flow_est.estimate(bars)
         self._cached_mu   = self.drift_est.estimate(bars, self._cached_flow)
         self._last_calib  = now
+
         logger.debug(
-            f"{self.symbol} | κ_eff={self._cached_flow.kappa_eff:.3f} "
-            f"µ={self._cached_mu:.5f} "
+            f"{self.symbol} | "
+            f"κ_eff={self._cached_flow.kappa_eff:.3f} "
+            f"µ={self._cached_mu:.6f} "
             f"cancel_imb={self._cached_flow.cancel_imbalance:.3f}"
         )
 
@@ -120,8 +142,8 @@ class CSTSignalGenerator:
 
         self._recalibrate(bars)
 
-        flow = self._cached_flow
-        mu   = self._cached_mu
+        flow           = self._cached_flow
+        mu             = self._cached_mu
         time_remaining = self._time_remaining()
 
         our_bid, our_ask = self.model.optimal_quotes(

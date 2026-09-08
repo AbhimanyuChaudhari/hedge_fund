@@ -167,4 +167,4 @@ class CombinedSignalGenerator:
                 return 'LONG'
             elif score < -p.score_threshold:
                 return 'SHORT'
-        return 'HOLD'
+        return 'HOLD'  
