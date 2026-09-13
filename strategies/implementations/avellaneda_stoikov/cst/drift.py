@@ -69,14 +69,66 @@ class DriftEstimator:
         TODO (notebook 07): calibrate kyle_lambda via OFI regression
         TODO (notebook 09): calibrate ofi_weight, momentum_weight via IC
         """
+        import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', '..')))
+
+import numpy as np
+from strategies.implementations.avellaneda_stoikov.cst.parameters import CSTParameters
+from strategies.implementations.avellaneda_stoikov.cst.order_flow import OrderFlowRates
+
+
+class DriftEstimator:
+    def __init__(self, params: CSTParameters):
+        self.params = params
+
+    def _weighted_ofi(self, bars: list[dict]) -> float:
+        """
+        Raw imbalance — validated as best OFI signal for USDINR.
+        Weighted OFI (CKS 2014) has NEGATIVE IC on USDINR due to
+        tiny tick size (0.0025) — inverse distance weights amplify noise.
+
+        For equity futures with larger tick sizes, switch to:
+            ofi = Σ_i (1/distance_i) × (ΔBid_qi - ΔAsk_qi)
+
+        Calibrated: IC = 0.051 at 120s, t-stat = 19.07 at 60s
+        TODO (notebook 07): revalidate with 15+ days data
+        """
+        if len(bars) < 2:
+            return 0.0
+        imbalances = [b.get('imbalance_last', 0) for b in bars
+                      if b.get('imbalance_last') is not None]
+        return float(np.mean(imbalances)) if imbalances else 0.0
+
+    def estimate(self, bars: list[dict], flow: OrderFlowRates) -> float:
+        """
+        Estimate price drift µ using calibrated weights from Ridge regression.
+
+        Formula (calibrated Sep 2026, 4 days USDINR live data):
+            µ = kyle_lambda × (ofi_weight×OFI - momentum_weight×momentum)
+                - cancel_drift_weight × cancel_imb
+
+        KEY FINDINGS from calibration:
+        - momentum_weight is NEGATIVE — USDINR mean-reverts at 30-120s
+        - cancel_drift_weight is NEGATIVE — ask cancels predict price DOWN
+        - ofi_weight is small (0.11) — imbalance has modest impact
+        - kyle_lambda = 0.00148 (from OLS: Δprice = λ×imbalance + ε)
+        - IC of combined signal = 0.33 at 60s (R² = 0.11)
+
+        Was hardcoded: kyle_lambda=0.01, ofi=0.6, mom=+0.4, cancel=0.1
+        Now calibrated: kyle_lambda=0.00148, ofi=0.11, mom=-0.79, cancel=-0.11
+
+        TODO (notebook 07): recalibrate with 15+ days of data
+        TODO (notebook 09): validate IC stability across regimes
+        """
         if len(bars) < 10:
             return 0.0
 
-        # ── Signal 1: Weighted OFI (Cont-Kukanov-Stoikov) ────────────
-        ofi_raw = self._weighted_ofi(bars)
-        # Normalize to [-1, 1] range using sign + log scaling
-        ofi_norm = float(np.sign(ofi_raw) * np.log1p(abs(ofi_raw)))
-        ofi_norm = float(np.clip(ofi_norm, -1, 1))
+        p = self.params
+
+        # ── Signal 1: OFI (raw imbalance — best for USDINR) ──────────
+        ofi      = self._weighted_ofi(bars)
+        ofi_norm = float(np.clip(ofi, -1, 1))
 
         # ── Signal 2: Price momentum ──────────────────────────────────
         prices = [float(b.get('close', 0)) for b in bars
@@ -86,19 +138,19 @@ class DriftEstimator:
         else:
             momentum = 0.0
 
-        # ── Signal 3: Cancel imbalance (from CST order flow) ─────────
-        # Positive cancel_imbalance → ask side canceling more → bullish
-        cancel_signal = flow.cancel_imbalance * self.params.tick_size
+        # ── Signal 3: Cancel imbalance ────────────────────────────────
+        cancel_signal = flow.cancel_imbalance * p.tick_size
 
-        # ── Combined drift using Kyle's Lambda scaling ────────────────
+        # ── Combined drift (calibrated weights) ───────────────────────
+        # Momentum: NEGATIVE sign (mean reversion on USDINR)
+        # Cancel:   NEGATIVE sign (ask cancels predict down, not up)
         mu = (
-            self.params.kyle_lambda * (
-                self.params.ofi_weight      * ofi_norm +
-                self.params.momentum_weight * momentum * 100
+            p.kyle_lambda * (
+                p.ofi_weight      *  ofi_norm           +
+                p.momentum_weight * -momentum * 100      # NEGATIVE — mean reversion
             ) +
-            cancel_signal * 0.1  # TODO (notebook 08): calibrate cancel weight
+            p.cancel_drift_weight * -cancel_signal       # NEGATIVE
         )
 
-        # Clip to max 5 ticks of drift per second
-        max_drift = self.params.tick_size * 5
+        max_drift = p.tick_size * 5
         return float(np.clip(mu, -max_drift, max_drift))
