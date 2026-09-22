@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 load_dotenv()
 
+from config.settings import settings
 from data.store.s3_client import S3Client
 from data.ingest.instrument_manager import InstrumentManager
 
@@ -22,23 +23,21 @@ from data.ingest.instrument_manager import InstrumentManager
 FLUSH_INTERVAL = 60  # seconds
 
 # ── Global state ───────────────────────────────────────────────────
-buffer           = []
-buffer_lock      = threading.Lock()
-TOKENS           = []
-TOKEN_TO_SYMBOL  = {}
-s3               = S3Client()
+buffer          = []
+buffer_lock     = threading.Lock()
+TOKENS          = []
+TOKEN_TO_SYMBOL = {}
+s3              = S3Client()
 
 # ── Market hours (IST seconds from midnight) ───────────────────────
 MARKET_SESSIONS = {
-    'equity':   (9*3600 + 15*60, 15*3600 + 30*60),  # 9:15am - 3:30pm
-    'currency': (9*3600,          17*3600),            # 9:00am - 5:00pm
+    'equity':   (9*3600 + 15*60, 15*3600 + 30*60),
+    'currency': (9*3600,          17*3600),
 }
-
 CURRENCY_SYMBOLS = {'USDINR', 'EURINR', 'GBPINR', 'JPYINR'}
 
 
 def is_market_hours(symbol: str) -> bool:
-    """Check if current time is within market hours for this symbol."""
     now_ist = (int(time.time()) + 19800) % 86400
     if any(c in symbol for c in CURRENCY_SYMBOLS):
         lo, hi = MARKET_SESSIONS['currency']
@@ -93,16 +92,16 @@ def parse_tick(tick: dict) -> dict:
         'weighted_mid':     round(weighted_mid, 4),
         'spread':           round(spread,        4),
         'book_imbalance':   round(imbalance,     6),
-        'bid_p1': bids[0].get('price',    0), 'bid_q1': bids[0].get('quantity', 0),
-        'bid_p2': bids[1].get('price',    0), 'bid_q2': bids[1].get('quantity', 0),
-        'bid_p3': bids[2].get('price',    0), 'bid_q3': bids[2].get('quantity', 0),
-        'bid_p4': bids[3].get('price',    0), 'bid_q4': bids[3].get('quantity', 0),
-        'bid_p5': bids[4].get('price',    0), 'bid_q5': bids[4].get('quantity', 0),
-        'ask_p1': asks[0].get('price',    0), 'ask_q1': asks[0].get('quantity', 0),
-        'ask_p2': asks[1].get('price',    0), 'ask_q2': asks[1].get('quantity', 0),
-        'ask_p3': asks[2].get('price',    0), 'ask_q3': asks[2].get('quantity', 0),
-        'ask_p4': asks[3].get('price',    0), 'ask_q4': asks[3].get('quantity', 0),
-        'ask_p5': asks[4].get('price',    0), 'ask_q5': asks[4].get('quantity', 0),
+        'bid_p1': bids[0].get('price', 0), 'bid_q1': bids[0].get('quantity', 0),
+        'bid_p2': bids[1].get('price', 0), 'bid_q2': bids[1].get('quantity', 0),
+        'bid_p3': bids[2].get('price', 0), 'bid_q3': bids[2].get('quantity', 0),
+        'bid_p4': bids[3].get('price', 0), 'bid_q4': bids[3].get('quantity', 0),
+        'bid_p5': bids[4].get('price', 0), 'bid_q5': bids[4].get('quantity', 0),
+        'ask_p1': asks[0].get('price', 0), 'ask_q1': asks[0].get('quantity', 0),
+        'ask_p2': asks[1].get('price', 0), 'ask_q2': asks[1].get('quantity', 0),
+        'ask_p3': asks[2].get('price', 0), 'ask_q3': asks[2].get('quantity', 0),
+        'ask_p4': asks[3].get('price', 0), 'ask_q4': asks[3].get('quantity', 0),
+        'ask_p5': asks[4].get('price', 0), 'ask_q5': asks[4].get('quantity', 0),
     }
 
 
@@ -123,10 +122,8 @@ def flush_buffer():
 
     flushed = 0
     for symbol, group in df.groupby('symbol'):
-        # Only write if ticks are from market hours
         if not is_market_hours(symbol):
             continue
-
         key = f'raw/orderbook/{symbol}/{date_str}/{timestamp_str}.parquet'
         try:
             buf = io.BytesIO()
@@ -196,12 +193,7 @@ def run_collector():
     global TOKENS, TOKEN_TO_SYMBOL
 
     from kiteconnect import KiteTicker
-    from data.ingest.zerodha_client import ZerodhaClient
 
-    # Get access token from ZerodhaClient
-    zc = ZerodhaClient()
-
-    # Use InstrumentManager the way it's designed
     mgr = InstrumentManager()
     mgr.get_all_instruments()
     tokens, token_map = mgr.get_tokens_and_symbols()
@@ -217,8 +209,8 @@ def run_collector():
     threading.Thread(target=flush_loop, daemon=True).start()
 
     kws = KiteTicker(
-        os.getenv('KITE_API_KEY'),
-        zc.kite.access_token
+        settings.zerodha_api_key,
+        settings.zerodha_access_token
     )
     kws.on_ticks       = on_ticks
     kws.on_connect     = on_connect
