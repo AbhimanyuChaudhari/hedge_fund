@@ -169,9 +169,6 @@ def on_connect(ws, response):
 
 def on_error(ws, code, reason):
     print(f'[WS ERROR] {code}: {reason}')
-    if '403' in str(reason) or 'Forbidden' in str(reason):
-        print('[TOKEN] 403 — flushing buffer before reconnect')
-        flush_buffer()
 
 
 def on_close(ws, code, reason):
@@ -180,11 +177,14 @@ def on_close(ws, code, reason):
 
 
 def on_reconnect(ws, attempts):
+    # KiteTicker's built-in reconnect handles resubscription automatically
+    # via on_connect being called again on the same ws object.
+    # DO NOT re-fetch instruments or re-init TOKENS here.
     print(f'[WS RECONNECT] Attempt {attempts}')
 
 
 def on_noreconnect(ws):
-    print('[WS NORECONNECT] Max attempts — flushing')
+    print('[WS NORECONNECT] Max attempts reached — flushing and exiting')
     flush_buffer()
 
 
@@ -194,6 +194,7 @@ def run_collector():
 
     from kiteconnect import KiteTicker
 
+    # Fetch instruments ONCE at startup
     mgr = InstrumentManager()
     mgr.get_all_instruments()
     tokens, token_map = mgr.get_tokens_and_symbols()
@@ -219,7 +220,9 @@ def run_collector():
     kws.on_reconnect   = on_reconnect
     kws.on_noreconnect = on_noreconnect
 
-    print('Starting WebSocket...')
+    # KiteTicker has built-in auto-reconnect — it will call on_connect
+    # again automatically after a drop, using the same TOKENS list.
+    print('Starting WebSocket (auto-reconnect enabled)...')
     kws.connect(threaded=False)
 
 
