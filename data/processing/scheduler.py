@@ -20,23 +20,22 @@ MIN_BARS = 10_000
 
 def get_pending_jobs() -> list[tuple]:
     """Find symbol/date combos with raw data but no processed file."""
+    # Use paginated list_files
+    raw_files  = s3.list_files('raw/orderbook/')
+    proc_files = s3.list_files('processed/1s/')
 
-    # Raw jobs
-    resp     = s3.client.list_objects_v2(Bucket=BUCKET, Prefix='raw/orderbook/')
     raw_jobs = set()
-    for obj in resp.get('Contents', []):
-        parts = obj['Key'].split('/')
+    for f in raw_files:
+        parts = f.split('/')
         if len(parts) >= 4:
             symbol = parts[2]
             date   = parts[3]
             if symbol and date and len(date) == 10:
                 raw_jobs.add((symbol, date))
 
-    # Processed jobs
-    resp      = s3.client.list_objects_v2(Bucket=BUCKET, Prefix='processed/1s/')
     proc_jobs = set()
-    for obj in resp.get('Contents', []):
-        parts = obj['Key'].split('/')
+    for f in proc_files:
+        parts = f.split('/')
         if len(parts) >= 4:
             symbol = parts[2]
             date   = parts[3].replace('.parquet', '')
