@@ -198,15 +198,16 @@ def run_collector():
     from kiteconnect import KiteTicker
     from data.ingest.zerodha_client import ZerodhaClient
 
-    zc   = ZerodhaClient()
-    mgr  = InstrumentManager(zc.kite)
-    instrs = mgr.get_instruments()
+    # Get access token from ZerodhaClient
+    zc = ZerodhaClient()
 
-    TOKEN_TO_SYMBOL = {
-        i['instrument_token']: i['tradingsymbol']
-        for i in instrs
-    }
-    TOKENS = list(TOKEN_TO_SYMBOL.keys())
+    # Use InstrumentManager the way it's designed
+    mgr = InstrumentManager()
+    mgr.get_all_instruments()
+    tokens, token_map = mgr.get_tokens_and_symbols()
+
+    TOKEN_TO_SYMBOL = token_map
+    TOKENS          = list(TOKEN_TO_SYMBOL.keys())
 
     print(f'=== Collector starting ===')
     print(f'Instruments: {len(TOKENS)}')
@@ -219,11 +220,11 @@ def run_collector():
         os.getenv('KITE_API_KEY'),
         zc.kite.access_token
     )
-    kws.on_ticks      = on_ticks
-    kws.on_connect    = on_connect
-    kws.on_error      = on_error
-    kws.on_close      = on_close
-    kws.on_reconnect  = on_reconnect
+    kws.on_ticks       = on_ticks
+    kws.on_connect     = on_connect
+    kws.on_error       = on_error
+    kws.on_close       = on_close
+    kws.on_reconnect   = on_reconnect
     kws.on_noreconnect = on_noreconnect
 
     print('Starting WebSocket...')
