@@ -223,7 +223,13 @@ def run_collector():
     # KiteTicker has built-in auto-reconnect — it will call on_connect
     # again automatically after a drop, using the same TOKENS list.
     print('Starting WebSocket (auto-reconnect enabled)...')
-    kws.connect(threaded=False)
+    while True:
+        try:
+            kws.connect(threaded=False)
+        except Exception as e:
+            print(f'[WS EXCEPTION] {e}')
+        print('[WS] Reconnecting in 5s...')
+        time.sleep(5)
 
 
 if __name__ == '__main__':
