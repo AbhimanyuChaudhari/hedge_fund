@@ -1,195 +1,112 @@
+"""
+Live tick collector — in-memory buffer → S3 raw parquet every 60s.
+No Redis. No candle builder. Direct S3 write.
+If WebSocket dies → buffer clears → no stale data.
+"""
 import io
 import os
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+
 import time
 import threading
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
-from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
-from data.store.s3_client import upload_dataframe
-from data.ingest.brokers import ZerodhaBroker, ShoonyaBroker
-from data.ingest.dynamic_subscriptions import DynamicSubscriptionManager
-from data.ingest.symbols import get_active_options, get_active_currency
+load_dotenv()
 
-ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
-load_dotenv(dotenv_path=ENV_PATH)
+from data.store.s3_client import S3Client
+from data.ingest.instrument_manager import InstrumentManager
 
-# ─────────────────────────────────────
-# Config
-# ─────────────────────────────────────
-ACTIVE_BROKER       = "zerodha"
-FLUSH_INTERVAL      = 60
+# ── Config ─────────────────────────────────────────────────────────
+FLUSH_INTERVAL = 60  # seconds
 
-COLLECT_OPTIONS     = True
-OPTIONS_UNDERLYINGS = ["NIFTY", "BANKNIFTY"]
-OPTIONS_EXPIRIES    = 2
+# ── Global state ───────────────────────────────────────────────────
+buffer           = []
+buffer_lock      = threading.Lock()
+TOKENS           = []
+TOKEN_TO_SYMBOL  = {}
+s3               = S3Client()
 
-COLLECT_CURRENCY    = True
-CURRENCY_PAIRS      = ["USDINR"]
-CURRENCY_OPTIONS    = False
-CURRENCY_EXPIRIES   = 2
-
-# Dynamic resubscription config
-DYNAMIC_REBALANCE        = True   # enable/disable
-REBALANCE_INTERVAL_SECS  = 1800   # every 30 minutes
-REBALANCE_MIN_SHIFT      = 2      # rebalance if ATM shifts 2+ strikes
-OPTIONS_STRIKES_EACH_SIDE = 10    # ATM ± 10
-
-# Spot index tokens
-SPOT_SYMBOLS = {
-    256265: "NIFTY_SPOT",
-    260105: "BANKNIFTY_SPOT",
+# ── Market hours (IST seconds from midnight) ───────────────────────
+MARKET_SESSIONS = {
+    'equity':   (9*3600 + 15*60, 15*3600 + 30*60),  # 9:15am - 3:30pm
+    'currency': (9*3600,          17*3600),            # 9:00am - 5:00pm
 }
 
-# Spot token → underlying name (for price tracking)
-SPOT_TO_UNDERLYING = {
-    256265: "NIFTY",
-    260105: "BANKNIFTY",
-}
-
-# ─────────────────────────────────────
-# RAM buffer
-# ─────────────────────────────────────
-buffer      = []
-buffer_lock = threading.Lock()
-TOKENS      = []
-TOKEN_TO_SYMBOL = {}
-
-# Live spot prices (updated from ticks)
-spot_prices     = {}
-spot_prices_lock = threading.Lock()
-
-# Dynamic subscription manager (set in run_collector)
-subscription_mgr = None
+CURRENCY_SYMBOLS = {'USDINR', 'EURINR', 'GBPINR', 'JPYINR'}
 
 
-# ─────────────────────────────────────
-# Tick parsers
-# ─────────────────────────────────────
-def parse_zerodha_tick(tick: dict) -> dict:
-    depth = tick.get("depth", {})
-    bids  = depth.get("buy",  [])
-    asks  = depth.get("sell", [])
+def is_market_hours(symbol: str) -> bool:
+    """Check if current time is within market hours for this symbol."""
+    now_ist = (int(time.time()) + 19800) % 86400
+    if any(c in symbol for c in CURRENCY_SYMBOLS):
+        lo, hi = MARKET_SESSIONS['currency']
+    else:
+        lo, hi = MARKET_SESSIONS['equity']
+    return lo <= now_ist <= hi
+
+
+# ── Tick parser ────────────────────────────────────────────────────
+def parse_tick(tick: dict) -> dict:
+    depth = tick.get('depth', {})
+    bids  = depth.get('buy',  [])
+    asks  = depth.get('sell', [])
 
     while len(bids) < 5:
-        bids.append({"price": 0, "quantity": 0, "orders": 0})
+        bids.append({'price': 0, 'quantity': 0, 'orders': 0})
     while len(asks) < 5:
-        asks.append({"price": 0, "quantity": 0, "orders": 0})
+        asks.append({'price': 0, 'quantity': 0, 'orders': 0})
 
-    best_bid      = bids[0].get("price", 0)
-    best_ask      = asks[0].get("price", 0)
+    best_bid      = bids[0].get('price',    0)
+    best_ask      = asks[0].get('price',    0)
+    bid_q1        = bids[0].get('quantity', 0)
+    ask_q1        = asks[0].get('quantity', 0)
     mid           = (best_bid + best_ask) / 2 if best_bid and best_ask else 0
     spread        = best_ask - best_bid if best_bid and best_ask else 0
-    total_bid_qty = tick.get("total_buy_quantity",  0)
-    total_ask_qty = tick.get("total_sell_quantity", 0)
+    total_bid_qty = tick.get('total_buy_quantity',  0)
+    total_ask_qty = tick.get('total_sell_quantity', 0)
     total_qty     = total_bid_qty + total_ask_qty
     imbalance     = (total_bid_qty - total_ask_qty) / total_qty if total_qty else 0
+    weighted_mid  = (
+        (best_bid * ask_q1 + best_ask * bid_q1) /
+        (bid_q1 + ask_q1)
+    ) if (bid_q1 + ask_q1) > 0 else mid
 
     return {
-        "ts_local_ns":      time.time_ns(),
-        "ts_exchange":      str(tick.get("exchange_timestamp", "")),
-        "ts_trade":         str(tick.get("last_trade_time", "")),
-        "symbol":           TOKEN_TO_SYMBOL.get(tick["instrument_token"], ""),
-        "instrument_token": str(tick["instrument_token"]),
-        "last_price":       tick.get("last_price", 0),
-        "last_qty":         tick.get("last_traded_quantity", 0),
-        "avg_price":        tick.get("average_traded_price", 0),
-        "volume":           tick.get("volume_traded", 0),
-        "open":             tick.get("ohlc", {}).get("open", 0),
-        "high":             tick.get("ohlc", {}).get("high", 0),
-        "low":              tick.get("ohlc", {}).get("low", 0),
-        "close":            tick.get("ohlc", {}).get("close", 0),
-        "oi":               tick.get("oi", 0),
-        "oi_day_high":      tick.get("oi_day_high", 0),
-        "oi_day_low":       tick.get("oi_day_low", 0),
-        "total_bid_qty":    total_bid_qty,
-        "total_ask_qty":    total_ask_qty,
-        "mid_price":        round(mid, 2),
-        "spread":           round(spread, 2),
-        "book_imbalance":   round(imbalance, 6),
-        "bid_p1": bids[0].get("price", 0), "bid_q1": bids[0].get("quantity", 0), "bid_o1": bids[0].get("orders", 0),
-        "bid_p2": bids[1].get("price", 0), "bid_q2": bids[1].get("quantity", 0), "bid_o2": bids[1].get("orders", 0),
-        "bid_p3": bids[2].get("price", 0), "bid_q3": bids[2].get("quantity", 0), "bid_o3": bids[2].get("orders", 0),
-        "bid_p4": bids[3].get("price", 0), "bid_q4": bids[3].get("quantity", 0), "bid_o4": bids[3].get("orders", 0),
-        "bid_p5": bids[4].get("price", 0), "bid_q5": bids[4].get("quantity", 0), "bid_o5": bids[4].get("orders", 0),
-        "ask_p1": asks[0].get("price", 0), "ask_q1": asks[0].get("quantity", 0), "ask_o1": asks[0].get("orders", 0),
-        "ask_p2": asks[1].get("price", 0), "ask_q2": asks[1].get("quantity", 0), "ask_o2": asks[1].get("orders", 0),
-        "ask_p3": asks[2].get("price", 0), "ask_q3": asks[2].get("quantity", 0), "ask_o3": asks[2].get("orders", 0),
-        "ask_p4": asks[3].get("price", 0), "ask_q4": asks[3].get("quantity", 0), "ask_o4": asks[3].get("orders", 0),
-        "ask_p5": asks[4].get("price", 0), "ask_q5": asks[4].get("quantity", 0), "ask_o5": asks[4].get("orders", 0),
+        'ts_local_ns':      time.time_ns(),
+        'ts_exchange':      str(tick.get('exchange_timestamp', '')),
+        'symbol':           TOKEN_TO_SYMBOL.get(tick['instrument_token'], ''),
+        'instrument_token': tick['instrument_token'],
+        'last_price':       tick.get('last_price',            0),
+        'last_qty':         tick.get('last_traded_quantity',  0),
+        'avg_price':        tick.get('average_traded_price',  0),
+        'volume':           tick.get('volume_traded',         0),
+        'open':             tick.get('ohlc', {}).get('open',  0),
+        'high':             tick.get('ohlc', {}).get('high',  0),
+        'low':              tick.get('ohlc', {}).get('low',   0),
+        'close':            tick.get('ohlc', {}).get('close', 0),
+        'oi':               tick.get('oi', 0),
+        'total_bid_qty':    total_bid_qty,
+        'total_ask_qty':    total_ask_qty,
+        'mid_price':        round(mid,          4),
+        'weighted_mid':     round(weighted_mid, 4),
+        'spread':           round(spread,        4),
+        'book_imbalance':   round(imbalance,     6),
+        'bid_p1': bids[0].get('price',    0), 'bid_q1': bids[0].get('quantity', 0),
+        'bid_p2': bids[1].get('price',    0), 'bid_q2': bids[1].get('quantity', 0),
+        'bid_p3': bids[2].get('price',    0), 'bid_q3': bids[2].get('quantity', 0),
+        'bid_p4': bids[3].get('price',    0), 'bid_q4': bids[3].get('quantity', 0),
+        'bid_p5': bids[4].get('price',    0), 'bid_q5': bids[4].get('quantity', 0),
+        'ask_p1': asks[0].get('price',    0), 'ask_q1': asks[0].get('quantity', 0),
+        'ask_p2': asks[1].get('price',    0), 'ask_q2': asks[1].get('quantity', 0),
+        'ask_p3': asks[2].get('price',    0), 'ask_q3': asks[2].get('quantity', 0),
+        'ask_p4': asks[3].get('price',    0), 'ask_q4': asks[3].get('quantity', 0),
+        'ask_p5': asks[4].get('price',    0), 'ask_q5': asks[4].get('quantity', 0),
     }
 
 
-def parse_shoonya_tick(tick: dict) -> dict:
-    def safe_float(val):
-        try:
-            return float(val)
-        except (TypeError, ValueError):
-            return 0.0
-
-    def safe_int(val):
-        try:
-            return int(val)
-        except (TypeError, ValueError):
-            return 0
-
-    token      = tick.get("tk", "")
-    symbol     = TOKEN_TO_SYMBOL.get(token, "")
-    last_price = safe_float(tick.get("lp", 0))
-
-    bids = []
-    asks = []
-    for i in range(1, 11):
-        bids.append({"price": safe_float(tick.get(f"bp{i}", 0)),
-                     "quantity": safe_int(tick.get(f"bq{i}", 0))})
-        asks.append({"price": safe_float(tick.get(f"sp{i}", 0)),
-                     "quantity": safe_int(tick.get(f"sq{i}", 0))})
-
-    best_bid      = bids[0]["price"]
-    best_ask      = asks[0]["price"]
-    mid           = (best_bid + best_ask) / 2 if best_bid and best_ask else 0
-    spread        = best_ask - best_bid if best_bid and best_ask else 0
-    total_bid_qty = sum(b["quantity"] for b in bids)
-    total_ask_qty = sum(a["quantity"] for a in asks)
-    total_qty     = total_bid_qty + total_ask_qty
-    imbalance     = (total_bid_qty - total_ask_qty) / total_qty if total_qty else 0
-
-    row = {
-        "ts_local_ns":      time.time_ns(),
-        "ts_exchange":      str(tick.get("ft", "")),
-        "ts_trade":         str(tick.get("ltt", "")),
-        "symbol":           symbol,
-        "instrument_token": token,
-        "last_price":       last_price,
-        "last_qty":         safe_int(tick.get("ls", 0)),
-        "avg_price":        safe_float(tick.get("ap", 0)),
-        "volume":           safe_int(tick.get("v", 0)),
-        "open":             safe_float(tick.get("o", 0)),
-        "high":             safe_float(tick.get("h", 0)),
-        "low":              safe_float(tick.get("l", 0)),
-        "close":            safe_float(tick.get("c", 0)),
-        "oi":               safe_int(tick.get("oi", 0)),
-        "oi_day_high":      safe_int(tick.get("poi", 0)),
-        "oi_day_low":       0,
-        "total_bid_qty":    total_bid_qty,
-        "total_ask_qty":    total_ask_qty,
-        "mid_price":        round(mid, 2),
-        "spread":           round(spread, 2),
-        "book_imbalance":   round(imbalance, 6),
-    }
-    for i, (bid, ask) in enumerate(zip(bids, asks), 1):
-        row[f"bid_p{i}"] = bid["price"]
-        row[f"bid_q{i}"] = bid["quantity"]
-        row[f"ask_p{i}"] = ask["price"]
-        row[f"ask_q{i}"] = ask["quantity"]
-    return row
-
-
-# ─────────────────────────────────────
-# Flush to GCS
-# ─────────────────────────────────────
+# ── S3 flush ───────────────────────────────────────────────────────
 def flush_buffer():
     global buffer
 
@@ -200,17 +117,34 @@ def flush_buffer():
         buffer = []
 
     df            = pd.DataFrame(rows)
-    now           = datetime.now()
-    date_str      = now.strftime("%Y-%m-%d")
-    timestamp_str = now.strftime("%H-%M-%S")
+    now           = datetime.now(timezone.utc)
+    date_str      = now.strftime('%Y-%m-%d')
+    timestamp_str = now.strftime('%H-%M-%S')
 
-    for symbol, group in df.groupby("symbol"):
-        blob_name = f"raw/orderbook/{symbol}/{date_str}/{timestamp_str}.parquet"
+    flushed = 0
+    for symbol, group in df.groupby('symbol'):
+        # Only write if ticks are from market hours
+        if not is_market_hours(symbol):
+            continue
+
+        key = f'raw/orderbook/{symbol}/{date_str}/{timestamp_str}.parquet'
         try:
-            upload_dataframe(group, blob_name)
-            print(f"[{timestamp_str}] GCS <- {blob_name} ({len(group)} ticks)")
+            buf = io.BytesIO()
+            group.reset_index(drop=True).to_parquet(
+                buf, index=False, compression='zstd'
+            )
+            buf.seek(0)
+            s3.client.put_object(
+                Bucket = s3.bucket,
+                Key    = key,
+                Body   = buf.getvalue(),
+            )
+            flushed += 1
         except Exception as e:
-            print(f"[GCS ERROR] {symbol}: {e}")
+            print(f'[S3 ERROR] {symbol}: {e}')
+
+    if flushed > 0:
+        print(f'[{timestamp_str}] Flushed {flushed} symbols → S3 raw')
 
 
 def flush_loop():
@@ -219,206 +153,82 @@ def flush_loop():
         flush_buffer()
 
 
-# ─────────────────────────────────────
-# WebSocket handlers
-# ─────────────────────────────────────
-def make_on_ticks(broker_name: str):
-    def on_ticks(ws, ticks):
-        global subscription_mgr
-
-        with buffer_lock:
-            for tick in ticks:
-                if broker_name == "zerodha":
-                    token = tick["instrument_token"]
-
-                    # Update spot prices from index ticks
-                    if token in SPOT_TO_UNDERLYING:
-                        underlying = SPOT_TO_UNDERLYING[token]
-                        price      = tick.get("last_price", 0)
-                        if price > 0:
-                            with spot_prices_lock:
-                                spot_prices[underlying] = price
-
-                    if token in TOKENS:
-                        buffer.append(parse_zerodha_tick(tick))
-                else:
-                    token = tick.get("tk", "")
-                    if token in TOKENS:
-                        buffer.append(parse_shoonya_tick(tick))
-
-        # Dynamic resubscription check (outside buffer lock)
-        if DYNAMIC_REBALANCE and subscription_mgr is not None:
-            with spot_prices_lock:
-                current_prices = spot_prices.copy()
-
-            if current_prices and subscription_mgr.should_rebalance():
-                changes = subscription_mgr.rebalance_if_needed(
-                    current_prices
-                )
-                if changes:
-                    for underlying, change in changes.items():
-                        # Update global token maps
-                        _update_token_maps(subscription_mgr)
-                        print(
-                            f"[REBALANCE] {underlying}: "
-                            f"ATM {change['old_atm']} -> {change['new_atm']} | "
-                            f"+{change['added']} -{change['removed']} tokens"
-                        )
-
-    return on_ticks
+# ── WebSocket handlers ─────────────────────────────────────────────
+def on_ticks(ws, ticks):
+    with buffer_lock:
+        for tick in ticks:
+            token = tick.get('instrument_token')
+            if token in TOKENS:
+                buffer.append(parse_tick(tick))
 
 
-def _update_token_maps(mgr: DynamicSubscriptionManager):
-    """Update global TOKENS and TOKEN_TO_SYMBOL after rebalance."""
-    global TOKENS, TOKEN_TO_SYMBOL
-    status = mgr.status()
-    for underlying, info in status.items():
-        # Tokens updated in mgr — rebuild TOKEN_TO_SYMBOL
-        # The new tokens are already subscribed by mgr
-        pass  # TOKEN_TO_SYMBOL updated by mgr internally
-
-
-def make_on_connect(broker, broker_name: str, instruments_df=None):
-    def on_connect(ws, response):
-        global subscription_mgr
-
-        ts = datetime.now().strftime("%H:%M:%S")
-        print(f"[{ts}] Connected.")
-        broker.subscribe(TOKENS)
-
-        symbols = [TOKEN_TO_SYMBOL.get(t, str(t)) for t in TOKENS]
-        futures = [s for s in symbols if s.endswith("FUT")]
-        options = [s for s in symbols if s.endswith(("CE", "PE"))]
-        spots   = [s for s in symbols if s.endswith("_SPOT")]
-
-        print(f"Subscribed to {len(symbols)} instruments")
-        print(f"  Futures: {len(futures)}")
-        print(f"  Options: {len(options)}")
-        print(f"  Spots:   {spots}")
-
-        # Initialize dynamic subscription manager
-        if DYNAMIC_REBALANCE and instruments_df is not None:
-            subscription_mgr = DynamicSubscriptionManager(
-                kite                = broker.kite,
-                kws                 = ws,
-                instruments_df      = instruments_df,
-                strikes_each_side   = OPTIONS_STRIKES_EACH_SIDE,
-                rebalance_interval  = REBALANCE_INTERVAL_SECS,
-                min_shift_strikes   = REBALANCE_MIN_SHIFT,
-            )
-            print(
-                f"Dynamic resubscription enabled "
-                f"(every {REBALANCE_INTERVAL_SECS//60}min, "
-                f"ATM±{OPTIONS_STRIKES_EACH_SIDE})"
-            )
-
-    return on_connect
+def on_connect(ws, response):
+    ts = datetime.now().strftime('%H:%M:%S')
+    print(f'[{ts}] WebSocket connected')
+    ws.subscribe(TOKENS)
+    ws.set_mode(ws.MODE_FULL, TOKENS)
+    print(f'Subscribed: {len(TOKENS)} instruments')
 
 
 def on_error(ws, code, reason):
-    print(f"[ERROR] {code}: {reason}")
-    if "403" in str(reason) or "Forbidden" in str(reason):
-        print("[TOKEN] 403 detected — running auto token refresh...")
-        try:
-            import subprocess
-            import sys
-            subprocess.Popen([
-                sys.executable,
-                "src/utils/auto_token.py"
-            ])
-            print("[TOKEN] Auto refresh triggered — collector will reconnect")
-        except Exception as e:
-            print(f"[TOKEN] Auto refresh failed: {e}")
+    print(f'[WS ERROR] {code}: {reason}')
+    if '403' in str(reason) or 'Forbidden' in str(reason):
+        print('[TOKEN] 403 — flushing buffer before reconnect')
+        flush_buffer()
 
 
 def on_close(ws, code, reason):
-    print(f"[CLOSE] {code}: {reason}")
+    print(f'[WS CLOSE] {code}: {reason}')
     flush_buffer()
 
 
-def on_reconnect(ws, attempts_count):
-    print(f"[RECONNECT] Attempt {attempts_count}...")
+def on_reconnect(ws, attempts):
+    print(f'[WS RECONNECT] Attempt {attempts}')
 
 
 def on_noreconnect(ws):
-    print("[NORECONNECT] Max attempts reached.")
+    print('[WS NORECONNECT] Max attempts — flushing')
     flush_buffer()
 
 
-# ─────────────────────────────────────
-# Entry point
-# ─────────────────────────────────────
+# ── Entry point ────────────────────────────────────────────────────
 def run_collector():
     global TOKENS, TOKEN_TO_SYMBOL
 
-    if ACTIVE_BROKER == "zerodha":
-        broker = ZerodhaBroker()
-    else:
-        broker = ShoonyaBroker()
+    from kiteconnect import KiteTicker
+    from data.ingest.zerodha_client import ZerodhaClient
 
-    broker.login()
+    zc   = ZerodhaClient()
+    mgr  = InstrumentManager(zc.kite)
+    instrs = mgr.get_instruments()
 
-    # Load instruments for dynamic resubscription
-    import pandas as pd
-    instruments_df = pd.DataFrame(broker.kite.instruments("NFO"))
-    instruments_df["expiry"] = pd.to_datetime(instruments_df["expiry"])
-
-    # ── Futures ───────────────────────────────────────
-    futures_symbols = broker.get_active_symbols(tier="all")
-    print(f"Futures:  {len(futures_symbols)} contracts")
-
-    # ── Options ───────────────────────────────────────
-    options_symbols = []
-    if COLLECT_OPTIONS:
-        options_symbols = get_active_options(
-            broker.kite,
-            underlyings  = OPTIONS_UNDERLYINGS,
-            num_expiries = OPTIONS_EXPIRIES,
-        )
-        print(f"Options:  {len(options_symbols)} contracts "
-              f"({OPTIONS_UNDERLYINGS}, {OPTIONS_EXPIRIES} expiries)")
-
-    # ── Currency ──────────────────────────────────────
-    currency_symbols = []
-    if COLLECT_CURRENCY:
-        currency_symbols = get_active_currency(
-            broker.kite,
-            pairs           = CURRENCY_PAIRS,
-            include_options = CURRENCY_OPTIONS,
-            num_expiries    = CURRENCY_EXPIRIES,
-        )
-        print(f"Currency: {len(currency_symbols)} contracts")
-
-    # ── Combine all ───────────────────────────────────
-    all_symbols     = futures_symbols + options_symbols + currency_symbols
     TOKEN_TO_SYMBOL = {
-        s["instrument_token"]: s["tradingsymbol"]
-        for s in all_symbols
+        i['instrument_token']: i['tradingsymbol']
+        for i in instrs
     }
-
-    # ── Add spot indices ──────────────────────────────
-    TOKEN_TO_SYMBOL.update(SPOT_SYMBOLS)
     TOKENS = list(TOKEN_TO_SYMBOL.keys())
 
-    print(f"Spots:    {list(SPOT_SYMBOLS.values())}")
-    print(f"Total:    {len(TOKENS)} instruments subscribed\n")
+    print(f'=== Collector starting ===')
+    print(f'Instruments: {len(TOKENS)}')
+    print(f'Flush:       every {FLUSH_INTERVAL}s → S3 raw/orderbook/')
+    print(f'No Redis. Market hours filter on flush.\n')
 
     threading.Thread(target=flush_loop, daemon=True).start()
-    print(f"Flush interval: {FLUSH_INTERVAL}s")
-    print(f"Broker: {ACTIVE_BROKER.upper()}")
-    print(f"Dynamic rebalance: {'ON' if DYNAMIC_REBALANCE else 'OFF'}\n")
 
-    broker.start_websocket(
-        on_tick        = make_on_ticks(ACTIVE_BROKER),
-        on_connect     = make_on_connect(
-                             broker, ACTIVE_BROKER, instruments_df
-                         ),
-        on_error       = on_error,
-        on_close       = on_close,
-        on_reconnect   = on_reconnect,
-        on_noreconnect = on_noreconnect,
+    kws = KiteTicker(
+        os.getenv('KITE_API_KEY'),
+        zc.kite.access_token
     )
+    kws.on_ticks      = on_ticks
+    kws.on_connect    = on_connect
+    kws.on_error      = on_error
+    kws.on_close      = on_close
+    kws.on_reconnect  = on_reconnect
+    kws.on_noreconnect = on_noreconnect
+
+    print('Starting WebSocket...')
+    kws.connect(threaded=False)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     run_collector()
