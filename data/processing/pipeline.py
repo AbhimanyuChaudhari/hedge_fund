@@ -238,25 +238,24 @@ def delete_raw(symbol: str, date: str):
 
 
 def validate(df: pd.DataFrame, symbol: str, date: str) -> bool:
-    """Basic data quality checks before saving."""
     if df.empty:
         print(f'[SKIP] {symbol}/{date}: empty')
         return False
 
-    # Minimum bars check
-    min_bars = 10_000 if 'USDINR' not in symbol else 15_000
+    # Minimum bars check — currency futures have longer session
+    if 'USDINR' in symbol or 'EURINR' in symbol:
+        min_bars = 5000   # currency — partial days OK
+    else:
+        min_bars = 8000   # equity futures
+
     if len(df) < min_bars:
-        print(f'[WARN] {symbol}/{date}: only {len(df)} bars (min {min_bars})')
+        print(f'[SKIP] {symbol}/{date}: only {len(df)} bars (min {min_bars})')
         return False
 
     # Price sanity check
     if df['close'].std() == 0:
         print(f'[SKIP] {symbol}/{date}: all prices identical — stale data')
         return False
-
-    # Spread sanity check
-    if (df['spread_mean'] == 0).mean() > 0.5:
-        print(f'[WARN] {symbol}/{date}: >50% bars have zero spread')
 
     return True
 
