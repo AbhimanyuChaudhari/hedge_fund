@@ -243,8 +243,8 @@ def validate(df: pd.DataFrame, symbol: str, date: str) -> bool:
         return False
 
     # Minimum bars check — currency futures have longer session
-    if 'USDINR' in symbol or 'EURINR' in symbol:
-        min_bars = 5000   # currency — partial days OK
+    if any(c in symbol for c in ['USDINR','EURINR','GBPINR','JPYINR']):
+        min_bars = 1000   # currency — partial days OK
     else:
         min_bars = 8000   # equity futures
 

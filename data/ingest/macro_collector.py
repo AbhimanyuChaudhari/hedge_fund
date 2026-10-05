@@ -195,7 +195,7 @@ class MacroCollector:
         os.makedirs('/tmp', exist_ok=True)
         df.to_parquet(path, index=False)
         s3_key = f'processed/macro/{date_str}.parquet'
-        self.s3.upload_file(path, s3_key)
+        self.s3.upload(path, s3_key)
         log.info(f'Saved {len(df)} macro snapshots → {s3_key}')
         self.snapshots = []
         os.remove(path)

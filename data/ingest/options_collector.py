@@ -204,11 +204,11 @@ class OptionsCollector:
         if not self.snapshots:
             return
         df      = pd.DataFrame(self.snapshots)
-        path    = f'C:/tmp/usdinr_options_{date_str}.parquet'
-        os.makedirs('C:/tmp', exist_ok=True)
+        path    = f'/tmp/usdinr_options_{date_str}.parquet'
+        os.makedirs('/tmp', exist_ok=True)
         df.to_parquet(path, index=False)
         s3_key  = f'processed/options/USDINR/{date_str}.parquet'
-        self.s3.upload_file(path, s3_key)
+        self.s3.upload(path, s3_key)
         log.info(f'Saved {len(df)} snapshots → {s3_key}')
         self.snapshots = []
         os.remove(path)
