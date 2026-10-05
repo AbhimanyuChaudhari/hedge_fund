@@ -1,3 +1,4 @@
+# data/ingest/instrument_manager.py
 import sys
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
@@ -6,7 +7,6 @@ import json
 import logging
 from datetime import datetime
 from data.ingest.zerodha_client import ZerodhaClient
-from data.store.redis_client import RedisClient
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -24,16 +24,26 @@ TOP_50_FUTURES = [
     "BRITANNIA", "CIPLA", "TECHM", "APOLLOHOSP", "BPCL", "SHRIRAMFIN"
 ]
 
-# USDINR monthly contract suffix pattern
-USDINR_MONTHLY = ["JANFUT", "FEBFUT", "MARFUT", "APRFUT", "MAYFUT",
-                  "JUNFUT", "JULFUT", "AUGFUT", "SEPFUT", "OCTFUT",
-                  "NOVFUT", "DECFUT"]
+USDINR_MONTHLY  = ["JANFUT","FEBFUT","MARFUT","APRFUT","MAYFUT",
+                   "JUNFUT","JULFUT","AUGFUT","SEPFUT","OCTFUT",
+                   "NOVFUT","DECFUT"]
+
+# All currency pairs to collect
+CURRENCY_PAIRS  = ["USDINR", "EURINR", "GBPINR", "JPYINR"]
+
+# Lot sizes per pair
+LOT_SIZES = {
+    "USDINR": 1000,
+    "EURINR": 1000,
+    "GBPINR": 1000,
+    "JPYINR": 1000,
+}
 
 
 class InstrumentManager:
     def __init__(self):
         self.zerodha = ZerodhaClient()
-        self.redis   = RedisClient()
+        self._cache  = None  # in-memory cache (no Redis)
 
     def get_active_futures(self) -> list[dict]:
         logger.info("Fetching NFO instrument list from Zerodha...")
@@ -76,76 +86,79 @@ class InstrumentManager:
         logger.info(f"Found {len(result)} active front-month equity futures")
         return result
 
-    def get_active_usdinr(self) -> list[dict]:
+    def get_active_currency_futures(self) -> list[dict]:
         """
-        Get front month USDINR futures from CDS exchange.
-        Uses monthly contracts only (not weekly) for liquidity.
+        Get front month futures for all currency pairs:
+        USDINR, EURINR, GBPINR, JPYINR
+        Uses monthly contracts only for liquidity
         """
-        logger.info("Fetching CDS instrument list for USDINR...")
+        logger.info("Fetching CDS instrument list for currency pairs...")
         instruments = self.zerodha.get_instruments("CDS")
 
         today   = datetime.today().date()
-        futures = []
+        result  = []
 
-        for inst in instruments:
-            if inst['instrument_type'] != 'FUT':
+        for pair in CURRENCY_PAIRS:
+            futures = []
+            for inst in instruments:
+                if inst['instrument_type'] != 'FUT':
+                    continue
+                if inst['name'] != pair:
+                    continue
+                # Monthly contracts only
+                symbol = inst['tradingsymbol']
+                if not any(symbol.endswith(m) for m in USDINR_MONTHLY):
+                    continue
+                expiry = inst['expiry']
+                if isinstance(expiry, str):
+                    expiry = datetime.strptime(expiry, '%Y-%m-%d').date()
+                if expiry < today:
+                    continue
+                futures.append(inst)
+
+            if not futures:
+                logger.warning(f"No {pair} futures found")
                 continue
-            if inst['name'] != 'USDINR':
-                continue
-            # Only monthly contracts (not weekly)
-            symbol = inst['tradingsymbol']
-            if not any(symbol.endswith(m) for m in USDINR_MONTHLY):
-                continue
-            expiry = inst['expiry']
+
+            # Front month only
+            front  = min(futures, key=lambda x: x['expiry'])
+            expiry = front['expiry']
             if isinstance(expiry, str):
                 expiry = datetime.strptime(expiry, '%Y-%m-%d').date()
-            if expiry < today:
-                continue
-            futures.append(inst)
 
-        if not futures:
-            logger.warning("No USDINR futures found")
-            return []
+            result.append({
+                'symbol':           front['tradingsymbol'],
+                'name':             pair,
+                'instrument_token': front['instrument_token'],
+                'expiry':           front['expiry'].strftime('%Y-%m-%d') if hasattr(front['expiry'], 'strftime') else str(front['expiry']),
+                'expiry_date':      expiry,
+                'lot_size':         LOT_SIZES.get(pair, 1000),
+                'exchange':         'CDS',
+                'instrument_type':  'currency_futures',
+            })
 
-        # Front month only
-        front = min(futures, key=lambda x: x['expiry'])
-        expiry = front['expiry']
-        if isinstance(expiry, str):
-            expiry = datetime.strptime(expiry, '%Y-%m-%d').date()
+            logger.info(f"{pair} front month: {front['tradingsymbol']} "
+                        f"(token: {front['instrument_token']})")
 
-        result = [{
-            'symbol':           front['tradingsymbol'],
-            'name':             'USDINR',
-            'instrument_token': front['instrument_token'],
-            'expiry':           front['expiry'].strftime('%Y-%m-%d') if hasattr(front['expiry'], 'strftime') else str(front['expiry']),
-            'expiry_date':      expiry,
-            'lot_size':         1000,
-            'exchange':         'CDS',
-            'instrument_type':  'currency_futures',
-        }]
-
-        logger.info(f"USDINR front month: {result[0]['symbol']} (token: {result[0]['instrument_token']})")
+        logger.info(f"Found {len(result)} active currency futures")
         return result
 
     def get_all_instruments(self) -> list[dict]:
-        """Get equity futures + USDINR combined."""
-        equity  = self.get_active_futures()
-        usdinr  = self.get_active_usdinr()
-        all_instruments = equity + usdinr
-        logger.info(f"Total instruments: {len(all_instruments)} ({len(equity)} equity + {len(usdinr)} currency)")
+        """Get equity futures + all currency pairs combined"""
+        equity    = self.get_active_futures()
+        currency  = self.get_active_currency_futures()
+        all_inst  = equity + currency
 
-        # Cache in Redis
-        self.redis.client.setex(
-            'active_futures',
-            86400,
-            json.dumps([{k: v for k, v in r.items() if k != 'expiry_date'} for r in all_instruments])
-        )
-        return all_instruments
+        logger.info(f"Total instruments: {len(all_inst)} "
+                    f"({len(equity)} equity + {len(currency)} currency)")
+
+        # In-memory cache (no Redis)
+        self._cache = all_inst
+        return all_inst
 
     def get_cached_futures(self) -> list[dict]:
-        data = self.redis.client.get('active_futures')
-        if data:
-            return json.loads(data)
+        if self._cache:
+            return self._cache
         return self.get_all_instruments()
 
     def get_tokens_and_symbols(self) -> tuple[list[int], dict[int, str]]:
@@ -155,9 +168,17 @@ class InstrumentManager:
         return tokens, token_map
 
     def get_instrument_type(self, token: int) -> str:
-        """Returns 'currency_futures' or 'equity_futures' for a token."""
         instruments = self.get_cached_futures()
         for inst in instruments:
             if inst['instrument_token'] == token:
                 return inst.get('instrument_type', 'equity_futures')
         return 'equity_futures'
+
+    def get_currency_tokens(self) -> dict[str, int]:
+        """Returns {pair_name: token} for all currency pairs"""
+        instruments = self.get_cached_futures()
+        return {
+            inst['name']: inst['instrument_token']
+            for inst in instruments
+            if inst['instrument_type'] == 'currency_futures'
+        }
