@@ -1,0 +1,165 @@
+{
+  "split_dates": {
+    "train": [
+      "2026-09-22",
+      "2026-09-23",
+      "2026-09-24",
+      "2026-09-25",
+      "2026-09-28",
+      "2026-09-30",
+      "2026-10-01",
+      "2026-10-05",
+      "2026-10-06",
+      "2026-10-07",
+      "2026-10-08",
+      "2026-10-09",
+      "2026-10-12",
+      "2026-10-13",
+      "2026-10-14"
+    ],
+    "val": [
+      "2026-10-15",
+      "2026-10-16",
+      "2026-10-19",
+      "2026-10-21",
+      "2026-10-22"
+    ],
+    "test": [
+      "2026-10-23",
+      "2026-10-26",
+      "2026-10-27",
+      "2026-10-28",
+      "2026-10-29",
+      "2026-10-30",
+      "2026-11-02",
+      "2026-11-03",
+      "2026-11-04",
+      "2026-11-05",
+      "2026-11-06",
+      "2026-11-09"
+    ]
+  },
+  "config": {
+    "hold_sec": 60,
+    "cost_bps": 1.0,
+    "thresholds": [
+      0.0,
+      0.1,
+      0.2,
+      0.3,
+      0.4,
+      0.5,
+      0.75,
+      1.0
+    ],
+    "state_size": {
+      "1": 0.59,
+      "2": 0.44,
+      "3": 0.65,
+      "4": 1.0
+    },
+    "state_stop": {
+      "1": 2.34,
+      "2": 3.08,
+      "3": 2.04,
+      "4": 1.33
+    },
+    "feature_set": "CHALLENGER50",
+    "signal": "ret_60s"
+  },
+  "signal_ic": {
+    "val": 0.2476,
+    "test": 0.2291
+  },
+  "best_threshold": 1.0,
+  "threshold_results": [
+    {
+      "total_pnl_bps": -1932.39,
+      "mean_pnl_bps": -0.53161,
+      "std_pnl_bps": 0.65404,
+      "sharpe": -49.004,
+      "hit_rate": 0.1659,
+      "max_drawdown_bps": -1932.0,
+      "n_trades": 3635,
+      "threshold": 0.0,
+      "pct_filtered": 1.8
+    },
+    {
+      "total_pnl_bps": -1454.5,
+      "mean_pnl_bps": -0.46307,
+      "std_pnl_bps": 0.71689,
+      "sharpe": -36.201,
+      "hit_rate": 0.1942,
+      "max_drawdown_bps": -1453.94,
+      "n_trades": 3141,
+      "threshold": 0.1,
+      "pct_filtered": 2.7
+    },
+    {
+      "total_pnl_bps": -865.48,
+      "mean_pnl_bps": -0.38776,
+      "std_pnl_bps": 0.73852,
+      "sharpe": -24.805,
+      "hit_rate": 0.2469,
+      "max_drawdown_bps": -865.23,
+      "n_trades": 2232,
+      "threshold": 0.2,
+      "pct_filtered": 3.7
+    },
+    {
+      "total_pnl_bps": -442.38,
+      "mean_pnl_bps": -0.3222,
+      "std_pnl_bps": 0.78498,
+      "sharpe": -15.209,
+      "hit_rate": 0.2986,
+      "max_drawdown_bps": -442.11,
+      "n_trades": 1373,
+      "threshold": 0.3,
+      "pct_filtered": 4.6
+    },
+    {
+      "total_pnl_bps": -245.4,
+      "mean_pnl_bps": -0.30333,
+      "std_pnl_bps": 0.82297,
+      "sharpe": -10.484,
+      "hit_rate": 0.3078,
+      "max_drawdown_bps": -245.18,
+      "n_trades": 809,
+      "threshold": 0.4,
+      "pct_filtered": 5.6
+    },
+    {
+      "total_pnl_bps": -121.29,
+      "mean_pnl_bps": -0.25696,
+      "std_pnl_bps": 0.88297,
+      "sharpe": -6.323,
+      "hit_rate": 0.3347,
+      "max_drawdown_bps": -126.47,
+      "n_trades": 472,
+      "threshold": 0.5,
+      "pct_filtered": 6.5
+    },
+    {
+      "total_pnl_bps": -9.8,
+      "mean_pnl_bps": -0.06015,
+      "std_pnl_bps": 1.08315,
+      "sharpe": -0.709,
+      "hit_rate": 0.4049,
+      "max_drawdown_bps": -34.81,
+      "n_trades": 163,
+      "threshold": 0.75,
+      "pct_filtered": 7.7
+    },
+    {
+      "total_pnl_bps": -1.88,
+      "mean_pnl_bps": -0.02799,
+      "std_pnl_bps": 0.91626,
+      "sharpe": -0.25,
+      "hit_rate": 0.4328,
+      "max_drawdown_bps": -6.2,
+      "n_trades": 67,
+      "threshold": 1.0,
+      "pct_filtered": 7.6
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "ic": {
+    "norm_val": 0.2556,
+    "norm_test": 0.2352,
+    "bps_val": 0.2516,
+    "bps_test": 0.2392
+  },
+  "sign_hit_bps_test": 49.5,
+  "best_scale": 2.0,
+  "config": {
+    "long_thresh_bps": 1.5,
+    "short_thresh_bps": 2.0,
+    "denormalize": "pred_bps = pred_norm * daily_std + daily_mean"
+  }
+}

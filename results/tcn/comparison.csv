@@ -1,0 +1,7 @@
+model,n_features,horizon_s,train_ic,val_ic,test_ic,test_rmse,test_hit,best_iter
+tcn_challenger50,50,60,0.0259,-0.0005,0.0287,0.9185,0.3797,2.0
+tcn_challenger50,50,300,0.0188,-0.0248,0.0134,2.3012,0.4692,2.0
+lgbm_base46,46,60,,,0.2211,,,
+lgbm_base46,46,300,,,0.1089,,,
+lgbm_challenger50,50,60,,,0.2322,,,
+lgbm_challenger50,50,300,,,0.1054,,,

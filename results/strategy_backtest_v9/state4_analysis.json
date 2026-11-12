@@ -1,0 +1,8 @@
+{
+  "total_bars": 23563,
+  "pct_above_thresh": 0.05,
+  "mean_pred": 0.0055,
+  "p90_pred": 0.2685,
+  "p95_pred": 0.3362,
+  "max_pred": 0.9047
+}

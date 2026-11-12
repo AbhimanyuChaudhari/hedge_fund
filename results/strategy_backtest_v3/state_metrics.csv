@@ -1,0 +1,2 @@
+total_pnl_bps,mean_pnl_bps,std_pnl_bps,sharpe,hit_rate,max_drawdown_bps,n_trades,state,pct_trades,size_mult,n_long,n_short
+-7.54,-0.12358,0.61611,-1.567,0.3607,-11.32,61,2,100.0,0.44,20,41

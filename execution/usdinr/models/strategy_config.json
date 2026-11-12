@@ -1,0 +1,19 @@
+{
+  "base_thresh":    0.70,
+  "state2_thresh":  0.90,
+  "cost_bps":       1.0,
+  "c_sl":           1.2,
+  "state_tp":       {"1": 1.0, "2": 1.0, "3": 1.0, "4": 0.60},
+  "state_vol":      {"1": 1.77, "2": 2.37, "3": 1.61, "4": 1.03},
+  "state_max_hold": {"1": 60, "2": 30, "3": 90, "4": 180},
+  "state_size":     {"1": 0.59, "2": 0.44, "3": 0.65, "4": 1.00},
+  "window_start":   37800,
+  "window_end":     52200,
+  "skip_start":     46800,
+  "skip_end":       50400,
+  "cj_market_thresh": 0.90,
+  "cj_limit_thresh":  0.70,
+  "cj_limit_timeout": 1,
+  "daily_loss_limit_bps": 10.0,
+  "max_open_positions": 1
+}  

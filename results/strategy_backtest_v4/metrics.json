@@ -1,0 +1,122 @@
+{
+  "split_dates": {
+    "train": [
+      "2026-09-22",
+      "2026-09-23",
+      "2026-09-24",
+      "2026-09-25",
+      "2026-09-28",
+      "2026-09-30",
+      "2026-10-01",
+      "2026-10-05",
+      "2026-10-06",
+      "2026-10-07",
+      "2026-10-08",
+      "2026-10-09",
+      "2026-10-12",
+      "2026-10-13",
+      "2026-10-14"
+    ],
+    "val": [
+      "2026-10-15",
+      "2026-10-16",
+      "2026-10-19",
+      "2026-10-21",
+      "2026-10-22"
+    ],
+    "test": [
+      "2026-10-23",
+      "2026-10-26",
+      "2026-10-27",
+      "2026-10-28",
+      "2026-10-29",
+      "2026-10-30",
+      "2026-11-02",
+      "2026-11-03",
+      "2026-11-04",
+      "2026-11-05",
+      "2026-11-06",
+      "2026-11-09"
+    ]
+  },
+  "config": {
+    "target": "ret_60s_dc (drift-corrected bps)",
+    "long_thresh_bps": 1.5,
+    "short_thresh_bps": 2.0,
+    "ofi_confirmation": false,
+    "ofi_col": null,
+    "sample_weights": "abs(ret_60s_dc), clipped at p99",
+    "time_window_ist": "10:30-14:30",
+    "state_size": {
+      "1": 0.59,
+      "2": 0.44,
+      "3": 0.65,
+      "4": 1.0
+    },
+    "state_stop": {
+      "1": 2.34,
+      "2": 3.08,
+      "3": 2.04,
+      "4": 1.33
+    }
+  },
+  "signal_ic": {
+    "val": 0.2371,
+    "test": 0.2111
+  },
+  "best_scale": 1.25,
+  "sweep": [
+    {
+      "total_pnl_bps": -0.71,
+      "mean_pnl_bps": -0.01546,
+      "std_pnl_bps": 0.91246,
+      "sharpe": -0.115,
+      "hit_rate": 0.3478,
+      "max_drawdown_bps": -4.66,
+      "n_trades": 46,
+      "scale": 0.5,
+      "n_long": 12,
+      "n_short": 34,
+      "pct_long": 26.1
+    },
+    {
+      "total_pnl_bps": -2.97,
+      "mean_pnl_bps": -0.22828,
+      "std_pnl_bps": 0.75786,
+      "sharpe": -1.086,
+      "hit_rate": 0.3846,
+      "max_drawdown_bps": -3.85,
+      "n_trades": 13,
+      "scale": 0.75,
+      "n_long": 2,
+      "n_short": 11,
+      "pct_long": 15.4
+    },
+    {
+      "total_pnl_bps": 0.39,
+      "mean_pnl_bps": 0.1289,
+      "std_pnl_bps": 0.6301,
+      "sharpe": 0.354,
+      "hit_rate": 0.3333,
+      "max_drawdown_bps": -0.63,
+      "n_trades": 3,
+      "scale": 1.0,
+      "n_long": 0,
+      "n_short": 3,
+      "pct_long": 0.0
+    },
+    {
+      "total_pnl_bps": 1.26,
+      "mean_pnl_bps": 0.42103,
+      "std_pnl_bps": 0.84212,
+      "sharpe": 0.866,
+      "hit_rate": 0.6667,
+      "max_drawdown_bps": -0.36,
+      "n_trades": 3,
+      "scale": 1.25,
+      "n_long": 0,
+      "n_short": 3,
+      "pct_long": 0.0
+    }
+  ]
+}

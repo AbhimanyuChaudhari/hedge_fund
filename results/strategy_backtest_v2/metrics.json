@@ -1,0 +1,149 @@
+{
+  "split_dates": {
+    "train": [
+      "2026-09-22",
+      "2026-09-23",
+      "2026-09-24",
+      "2026-09-25",
+      "2026-09-28",
+      "2026-09-30",
+      "2026-10-01",
+      "2026-10-05",
+      "2026-10-06",
+      "2026-10-07",
+      "2026-10-08",
+      "2026-10-09",
+      "2026-10-12",
+      "2026-10-13",
+      "2026-10-14"
+    ],
+    "val": [
+      "2026-10-15",
+      "2026-10-16",
+      "2026-10-19",
+      "2026-10-21",
+      "2026-10-22"
+    ],
+    "test": [
+      "2026-10-23",
+      "2026-10-26",
+      "2026-10-27",
+      "2026-10-28",
+      "2026-10-29",
+      "2026-10-30",
+      "2026-11-02",
+      "2026-11-03",
+      "2026-11-04",
+      "2026-11-05",
+      "2026-11-06",
+      "2026-11-09"
+    ]
+  },
+  "config": {
+    "hold_sec": 60,
+    "cost_bps": 1.0,
+    "long_thresh": 0.8,
+    "short_thresh": 1.2,
+    "threshold_scales": [
+      0.5,
+      0.75,
+      1.0,
+      1.25,
+      1.5,
+      2.0
+    ],
+    "time_window_ist": "10:30-14:30",
+    "state_size": {
+      "1": 0.59,
+      "2": 0.44,
+      "3": 0.65,
+      "4": 1.0
+    },
+    "state_stop": {
+      "1": 2.34,
+      "2": 3.08,
+      "3": 2.04,
+      "4": 1.33
+    },
+    "feature_set": "CHALLENGER50",
+    "target": "ret_60s_norm",
+    "signal": "ret_60s"
+  },
+  "signal_ic": {
+    "val": 0.255,
+    "test": 0.2378
+  },
+  "best_scale": 1.0,
+  "threshold_results": [
+    {
+      "total_pnl_bps": -46.39,
+      "mean_pnl_bps": -0.12305,
+      "std_pnl_bps": 0.86169,
+      "sharpe": -2.773,
+      "hit_rate": 0.3899,
+      "max_drawdown_bps": -61.24,
+      "n_trades": 377,
+      "scale": 0.5,
+      "long_thresh": 0.4,
+      "short_thresh": 0.6,
+      "n_long": 251,
+      "n_short": 126
+    },
+    {
+      "total_pnl_bps": -0.79,
+      "mean_pnl_bps": -0.01079,
+      "std_pnl_bps": 1.15175,
+      "sharpe": -0.08,
+      "hit_rate": 0.4384,
+      "max_drawdown_bps": -15.42,
+      "n_trades": 73,
+      "scale": 0.75,
+      "long_thresh": 0.6,
+      "short_thresh": 0.9,
+      "n_long": 42,
+      "n_short": 31
+    },
+    {
+      "total_pnl_bps": 13.76,
+      "mean_pnl_bps": 0.72395,
+      "std_pnl_bps": 1.51235,
+      "sharpe": 2.087,
+      "hit_rate": 0.5263,
+      "max_drawdown_bps": -0.93,
+      "n_trades": 19,
+      "scale": 1.0,
+      "long_thresh": 0.8,
+      "short_thresh": 1.2,
+      "n_long": 10,
+      "n_short": 9
+    },
+    {
+      "total_pnl_bps": 7.35,
+      "mean_pnl_bps": 0.91919,
+      "std_pnl_bps": 1.57291,
+      "sharpe": 1.653,
+      "hit_rate": 0.75,
+      "max_drawdown_bps": -0.51,
+      "n_trades": 8,
+      "scale": 1.25,
+      "long_thresh": 1.0,
+      "short_thresh": 1.5,
+      "n_long": 4,
+      "n_short": 4
+    },
+    {
+      "total_pnl_bps": 1.71,
+      "mean_pnl_bps": 0.85286,
+      "std_pnl_bps": 0.73849,
+      "sharpe": 1.633,
+      "hit_rate": 1.0,
+      "max_drawdown_bps": 0.0,
+      "n_trades": 2,
+      "scale": 1.5,
+      "long_thresh": 1.2,
+      "short_thresh": 1.8,
+      "n_long": 0,
+      "n_short": 2
+    }
+  ]
+}

@@ -1,0 +1,183 @@
+{
+  "split_dates": {
+    "train": [
+      "2026-09-22",
+      "2026-09-23",
+      "2026-09-24",
+      "2026-09-25",
+      "2026-09-28",
+      "2026-09-30",
+      "2026-10-01",
+      "2026-10-05",
+      "2026-10-06",
+      "2026-10-07",
+      "2026-10-08",
+      "2026-10-09",
+      "2026-10-12",
+      "2026-10-13",
+      "2026-10-14"
+    ],
+    "val": [
+      "2026-10-15",
+      "2026-10-16",
+      "2026-10-19",
+      "2026-10-21",
+      "2026-10-22"
+    ],
+    "test": [
+      "2026-10-23",
+      "2026-10-26",
+      "2026-10-27",
+      "2026-10-28",
+      "2026-10-29",
+      "2026-10-30",
+      "2026-11-02",
+      "2026-11-03",
+      "2026-11-04",
+      "2026-11-05",
+      "2026-11-06",
+      "2026-11-09"
+    ]
+  },
+  "config": {
+    "hold_sec": 60,
+    "cost_bps": 1.0,
+    "state_thresholds": {
+      "1": {
+        "long": 0.8,
+        "short": 1.2
+      },
+      "2": {
+        "long": 0.5,
+        "short": 0.7
+      },
+      "3": {
+        "long": 0.8,
+        "short": 1.2
+      },
+      "4": {
+        "long": 1.0,
+        "short": 1.5
+      }
+    },
+    "threshold_scales": [
+      0.5,
+      0.75,
+      1.0,
+      1.25,
+      1.5,
+      2.0
+    ],
+    "state_time_filter": {
+      "1": true,
+      "2": false,
+      "3": true,
+      "4": true
+    },
+    "state_size": {
+      "1": 0.59,
+      "2": 0.44,
+      "3": 0.65,
+      "4": 1.0
+    },
+    "state_stop": {
+      "1": 2.34,
+      "2": 3.08,
+      "3": 2.04,
+      "4": 1.33
+    },
+    "feature_set": "CHALLENGER50",
+    "target": "ret_60s_norm"
+  },
+  "signal_ic": {
+    "val": 0.2378,
+    "test": 0.2127
+  },
+  "best_scale": 2.0,
+  "sweep": [
+    {
+      "total_pnl_bps": -336.51,
+      "mean_pnl_bps": -0.24871,
+      "std_pnl_bps": 0.54835,
+      "sharpe": -16.684,
+      "hit_rate": 0.2749,
+      "max_drawdown_bps": -335.95,
+      "n_trades": 1353,
+      "scale": 0.5,
+      "n_long": 741,
+      "n_short": 612,
+      "n_state2": 1265,
+      "pct_state2": 93.5
+    },
+    {
+      "total_pnl_bps": -181.22,
+      "mean_pnl_bps": -0.21651,
+      "std_pnl_bps": 0.5879,
+      "sharpe": -10.655,
+      "hit_rate": 0.3035,
+      "max_drawdown_bps": -184.99,
+      "n_trades": 837,
+      "scale": 0.75,
+      "n_long": 466,
+      "n_short": 371,
+      "n_state2": 823,
+      "pct_state2": 98.3
+    },
+    {
+      "total_pnl_bps": -104.72,
+      "mean_pnl_bps": -0.21241,
+      "std_pnl_bps": 0.587,
+      "sharpe": -8.035,
+      "hit_rate": 0.2982,
+      "max_drawdown_bps": -109.91,
+      "n_trades": 493,
+      "scale": 1.0,
+      "n_long": 290,
+      "n_short": 203,
+      "n_state2": 492,
+      "pct_state2": 99.8
+    },
+    {
+      "total_pnl_bps": -50.8,
+      "mean_pnl_bps": -0.18473,
+      "std_pnl_bps": 0.61549,
+      "sharpe": -4.977,
+      "hit_rate": 0.3309,
+      "max_drawdown_bps": -55.78,
+      "n_trades": 275,
+      "scale": 1.25,
+      "n_long": 156,
+      "n_short": 119,
+      "n_state2": 275,
+      "pct_state2": 100.0
+    },
+    {
+      "total_pnl_bps": -22.84,
+      "mean_pnl_bps": -0.14277,
+      "std_pnl_bps": 0.68125,
+      "sharpe": -2.651,
+      "hit_rate": 0.3625,
+      "max_drawdown_bps": -29.96,
+      "n_trades": 160,
+      "scale": 1.5,
+      "n_long": 80,
+      "n_short": 80,
+      "n_state2": 160,
+      "pct_state2": 100.0
+    },
+    {
+      "total_pnl_bps": -7.54,
+      "mean_pnl_bps": -0.12358,
+      "std_pnl_bps": 0.61611,
+      "sharpe": -1.567,
+      "hit_rate": 0.3607,
+      "max_drawdown_bps": -11.32,
+      "n_trades": 61,
+      "scale": 2.0,
+      "n_long": 20,
+      "n_short": 41,
+      "n_state2": 61,
+      "pct_state2": 100.0
+    }
+  ]
+}
