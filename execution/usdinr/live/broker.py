@@ -3,13 +3,13 @@ execution/usdinr/live/broker.py
 Zerodha Kite Connect broker wrapper for USDINR futures.
 Credentials loaded from .env via python-dotenv (matches existing pipeline).
 Paper mode: set PAPER_TRADE=1 or pass paper=True.
+  - Paper mode = real KiteTicker ticks, fake order placement.
 """
 
 import os
-import time
 import logging
 from enum import Enum
-from typing import Optional, Callable
+from typing import Optional, Callable, List
 
 try:
     from dotenv import load_dotenv
@@ -30,25 +30,26 @@ class ZerodhaBroker:
     Thin wrapper around KiteConnect.
     Uses ZERODHA_API_KEY and ZERODHA_ACCESS_TOKEN env vars
     (same names as the existing data pipeline in config/settings.py).
+
+    Paper mode: orders are logged but never sent to exchange.
+    Ticks always come from live KiteTicker regardless of paper mode.
     """
 
     def __init__(self, paper: bool = False):
         self.paper = paper or (os.getenv("PAPER_TRADE", "0") == "1")
-        self._kite = None
+        self._kite  = None
+        self._kws   = None
         self._paper_order_counter = 0
-
-        if not self.paper:
-            self._init_kite()
+        self._init_kite()
 
     def _init_kite(self):
         from kiteconnect import KiteConnect
-        api_key    = os.environ["ZERODHA_API_KEY"]
-        api_secret = os.environ.get("ZERODHA_API_SECRET", "")
+        api_key      = os.environ["ZERODHA_API_KEY"]
         access_token = os.environ["ZERODHA_ACCESS_TOKEN"]
-
         self._kite = KiteConnect(api_key=api_key)
         self._kite.set_access_token(access_token)
-        log.info("KiteConnect initialised (live mode)")
+        mode = "PAPER" if self.paper else "LIVE"
+        log.info("KiteConnect initialised (%s mode)", mode)
 
     # ------------------------------------------------------------------
     # Order management
@@ -57,8 +58,8 @@ class ZerodhaBroker:
     def place_order(
         self,
         symbol: str,
-        side: str,           # "BUY" or "SELL"
-        size: int,           # number of lots
+        side: str,            # "BUY" or "SELL"
+        size: int,            # number of lots
         order_type: OrderType,
         limit_price: Optional[float] = None,
         lots: int = 1,
@@ -115,9 +116,7 @@ class ZerodhaBroker:
     # ------------------------------------------------------------------
 
     def get_ltp(self, symbol: str) -> Optional[float]:
-        """Last traded price. Returns None in paper mode (caller uses tick)."""
-        if self.paper:
-            return None
+        """Last traded price."""
         try:
             data = self._kite.ltp(f"CDS:{symbol}")
             return data[f"CDS:{symbol}"]["last_price"]
@@ -126,8 +125,6 @@ class ZerodhaBroker:
             return None
 
     def get_instrument_token(self, symbol: str) -> Optional[int]:
-        if self.paper:
-            return 0
         try:
             instruments = self._kite.instruments("CDS")
             for inst in instruments:
@@ -139,31 +136,26 @@ class ZerodhaBroker:
 
     def stream_ticks(
         self,
-        instrument_token: int,
-        on_tick: Callable[[dict], None],
+        tokens: List[int],
+        on_ticks: Callable,
     ) -> None:
         """
         Subscribe to live tick stream via KiteTicker.
-        Calls on_tick(tick_dict) for every tick received.
-        Blocks until connection drops.
+        Calls on_ticks(ws, ticks) for every tick received.
+        Always connects to live KiteTicker — paper mode only affects orders.
+        Runs in a background thread; returns immediately.
         """
-        if self.paper:
-            log.info("PAPER mode — no live tick stream; use synthetic ticks in runner.")
-            return
-
         from kiteconnect import KiteTicker
-        api_key     = os.environ["ZERODHA_API_KEY"]
+        api_key      = os.environ["ZERODHA_API_KEY"]
         access_token = os.environ["ZERODHA_ACCESS_TOKEN"]
 
         kws = KiteTicker(api_key, access_token)
-
-        def _on_ticks(ws, ticks):
-            for tick in ticks:
-                on_tick(tick)
+        self._kws = kws
 
         def _on_connect(ws, response):
-            ws.subscribe([instrument_token])
-            ws.set_mode(ws.MODE_FULL, [instrument_token])
+            ws.subscribe(tokens)
+            ws.set_mode(ws.MODE_FULL, tokens)
+            log.info("KiteTicker connected — subscribed to %s", tokens)
 
         def _on_error(ws, code, reason):
             log.error("KiteTicker error %s: %s", code, reason)
@@ -171,9 +163,18 @@ class ZerodhaBroker:
         def _on_close(ws, code, reason):
             log.warning("KiteTicker closed %s: %s", code, reason)
 
-        kws.on_ticks    = _on_ticks
-        kws.on_connect  = _on_connect
-        kws.on_error    = _on_error
-        kws.on_close    = _on_close
+        kws.on_ticks   = on_ticks
+        kws.on_connect = _on_connect
+        kws.on_error   = _on_error
+        kws.on_close   = _on_close
 
-        kws.connect(threaded=False)
+        # threaded=True returns immediately; tick callbacks fire in background
+        kws.connect(threaded=True)
+        log.info("KiteTicker started in background thread")
+
+    def stop_stream(self) -> None:
+        if self._kws is not None:
+            try:
+                self._kws.stop()
+            except Exception as exc:
+                log.warning("stop_stream error: %s", exc)
