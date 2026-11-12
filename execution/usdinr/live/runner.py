@@ -1,9 +1,9 @@
 """
-execution/USDINR/live/runner.py
+execution/usdinr/live/runner.py
 Main loop — wires everything together.
 
 Run from project root:
-    python -m execution.USDINR.live.runner --symbol USDINR26NOVFUT [--paper]
+    python -m execution.usdinr.live.runner --symbol USDINR26NOVFUT [--paper]
 """
 
 import os
@@ -93,6 +93,10 @@ class LiveRunner:
         self._tick_lock    = threading.Lock()
         self._last_ts_proc = 0
 
+        # for 1-minute return tracking → feeds daily_sigma
+        self._last_min_mid  = 0.0
+        self._last_min_ts   = 0
+
     def _on_ticks(self, ws, ticks: list) -> None:
         for t in ticks:
             bid = t.get("depth", {}).get("buy",  [{}])[0].get("price", 0)
@@ -102,13 +106,34 @@ class LiveRunner:
                 self._latest_mid  = mid
                 self._latest_tick = t
 
+    def _maybe_push_minute_ret(self, ts_now: int, mid_now: float) -> None:
+        """Push 1-minute return to SignalEngine every 60 seconds."""
+        if self._last_min_mid <= 0:
+            self._last_min_mid = mid_now
+            self._last_min_ts  = ts_now
+            return
+        elapsed = ts_now - self._last_min_ts
+        if elapsed >= 60:
+            ret_bps = (mid_now - self._last_min_mid) / self._last_min_mid * 10_000
+            self.signal.push_daily_ret(ret_bps)
+            log.debug("1m ret=%.3f bps  sigma=%s", ret_bps, self.signal._daily_sigma)
+            self._last_min_mid = mid_now
+            self._last_min_ts  = ts_now
+
     def run(self) -> None:
         self.signal.reset_day()
         self.risk.reset_day()
 
         token = self.broker.get_instrument_token(self.symbol)
+        if token is None:
+            raise RuntimeError(f"Could not find instrument token for {self.symbol}")
+
+        log.info("Instrument token for %s: %d", self.symbol, token)
         self.broker.stream_ticks([token], self._on_ticks)
         log.info("LiveRunner started  symbol=%s  paper=%s", self.symbol, self.broker.paper)
+
+        # wait briefly for first tick
+        time.sleep(2)
 
         while True:
             ts_now = int(time.time())
@@ -122,10 +147,14 @@ class LiveRunner:
                 tick_data = dict(self._latest_tick)
 
             if mid_now <= 0:
+                log.debug("Waiting for first tick...")
                 continue
 
             bar = _tick_to_bar(tick_data, ts_now, mid_now)
             self.feat_buf.push(bar)
+
+            # feed 1-minute returns so daily_sigma builds up
+            self._maybe_push_minute_ret(ts_now, mid_now)
 
             # session end
             ist_s = ist_seconds_since_midnight()
@@ -139,26 +168,36 @@ class LiveRunner:
             if closed is not None:
                 self.risk.record_trade(closed.net_ret_bps)
                 self.tlog.log_trade(closed)
+                log.info(
+                    "Trade closed | reason=%s  net_pnl=%.2f bps",
+                    closed.exit_reason, closed.net_ret_bps,
+                )
 
-            # entry logic
+            # entry logic — only inside window
             if not in_trading_window(self.cfg):
                 continue
             if not self.exec_eng.is_flat:
                 continue
 
-            try:
-                feat_vec = self.feat_buf.latest_vector()
-            except RuntimeError as e:
-                log.warning("Feature build failed: %s", e)
-                continue
+            feat_vec = self.feat_buf.latest_vector()
             if feat_vec is None:
+                log.debug("Feature buffer not ready yet (need 300 bars)")
                 continue
 
             tick_count = bar.get("tick_count", 0)
             pred_norm, hmm_state, raw_pred = self.signal.predict(feat_vec, tick_count)
 
-            if pred_norm is None or hmm_state is None:
+            if pred_norm is None:
+                log.debug("pred_norm=None (daily_sigma not ready yet, need 5 minutes)")
                 continue
+            if hmm_state is None:
+                log.debug("hmm_state=None (need 10 HMM observations)")
+                continue
+
+            log.info(
+                "Signal | pred_norm=%.3f  state=%s  raw=%.5f",
+                pred_norm, hmm_state, raw_pred,
+            )
 
             try:
                 self.risk.check_entry()
@@ -166,13 +205,18 @@ class LiveRunner:
                 log.warning("Risk block: %s", e)
                 continue
 
-            self.exec_eng.try_entry(
+            entered = self.exec_eng.try_entry(
                 symbol    = self.symbol,
                 ts_now    = ts_now,
                 mid_now   = mid_now,
                 pred_norm = pred_norm,
                 state     = hmm_state,
             )
+            if entered:
+                log.info(
+                    "Entry | side=%s  mid=%.4f  pred_norm=%.3f  state=%d",
+                    "BUY", mid_now, pred_norm, hmm_state,
+                )
 
 
 def main():
